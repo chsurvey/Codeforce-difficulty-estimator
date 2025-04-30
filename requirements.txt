@@ -1,0 +1,8 @@
+torch>=2.0
+transformers>=4.40
+scikit-learn
+pandas
+numpy
+tqdm
+sentencepiece
+wandb
