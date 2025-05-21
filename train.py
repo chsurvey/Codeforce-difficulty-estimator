@@ -30,57 +30,95 @@ def get_args():
 #                   1.  Collate fn                                            #
 # --------------------------------------------------------------------------- #
 class Collator:
-    def __init__(self, txt_tok, code_tok,
-                 max_lt: int, max_lc: int, feat_dim: int):
+    """
+    Batching function that
+      • prepends **two** CLS tokens and appends one SEP token to *both*
+        the description prompt and the code solution,
+      • lets the 🤗 FastTokenizer handle padding in a single call,
+      • concatenates the fixed tokens with simple tensor ops
+        (no Python for-loops → faster),
+      • returns (text_ids, text_mask, code_ids, code_type_ids, code_mask,
+                 explicit_feats, labels).
+    """
+    def __init__(
+        self,
+        txt_tok,
+        code_tok,
+        max_lt: int,
+        max_lc: int,
+        feat_dim: int,
+    ):
         self.txt_tok, self.code_tok = txt_tok, code_tok
         self.max_lt, self.max_lc = max_lt, max_lc
         self.feat_dim = feat_dim
-        self.cls_id_txt  = txt_tok.cls_token_id
-        self.sep_id_txt  = txt_tok.sep_token_id
+
+        self.cls_id_txt = txt_tok.cls_token_id
+        self.sep_id_txt = txt_tok.sep_token_id
         self.cls_id_code = code_tok.cls_token_id
         self.sep_id_code = code_tok.sep_token_id
 
-    def __call__(self, batch):
+    # --------------------------------------------------------------------- #
+    #                                CALL                                   #
+    # --------------------------------------------------------------------- #
+    def __call__(
+        self, batch: List[Tuple[str, str, torch.Tensor, int]]
+    ):
+        batch = [ex for ex in batch if ex[-1] != -1]
+        if not batch:                          # ← 전체가 드롭된 rare 케이스
+            return None                        #   train loop에서 skip
+        
         descs, codes, feats, labels = zip(*batch)
+        B = len(batch)
 
-        # --- text prompt --------------------------------------------------- #
-        t = self.txt_tok(list(descs), add_special_tokens=False,
-                         truncation=True, max_length=self.max_lt-3)
-        text_ids  = []
-        text_mask = []
-        for ids, attn in zip(t["input_ids"], t["attention_mask"]):
-            ids = [self.cls_id_txt, self.cls_id_txt] + ids + [self.sep_id_txt]
-            mask= [1]*len(ids)
-            text_ids.append(ids)
-            text_mask.append(mask)
-        text = self.txt_tok.pad(
-            {"input_ids":text_ids, "attention_mask":text_mask},
-            padding="longest", return_tensors="pt")
+        # ---------------------- 1.  TEXT (prompt) ------------------------- #
+        enc_t = self.txt_tok(
+            list(descs),
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_lt - 3,      # leave room for 2×CLS + SEP
+            padding=True,
+            return_tensors="pt",
+        )
+        prefix_txt = torch.full((B, 2), self.cls_id_txt, dtype=torch.long)
+        sep_txt    = torch.full((B, 1), self.sep_id_txt,  dtype=torch.long)
 
-        # --- code solution -------------------------------------------------- #
-        c = self.code_tok(list(codes), add_special_tokens=False,
-                          truncation=True, max_length=self.max_lc-3)
-        code_ids, code_mask, code_type = [], [], []
-        for ids, attn in zip(c["input_ids"], c["attention_mask"]):
-            ids = [self.cls_id_code, self.cls_id_code] + ids + [self.sep_id_code]
-            mask= [1]*len(ids)
-            tpe = [0]*len(ids)           # JOERN 타입 정보 없음 → 0
-            code_ids.append(ids)
-            code_mask.append(mask)
-            code_type.append(tpe)
-        code = self.code_tok.pad(
-            {"input_ids":code_ids, "attention_mask":code_mask},
-            padding="longest", return_tensors="pt")
-        code["type_ids"] = torch.tensor(
-            [seq + [0]*(code["input_ids"].size(1)-len(seq)) for seq in code_type])
+        text_ids  = torch.cat([prefix_txt, enc_t["input_ids"], sep_txt], dim=1)
+        text_mask = torch.cat(
+            [torch.ones_like(prefix_txt), enc_t["attention_mask"], torch.ones_like(sep_txt)],
+            dim=1,
+        )
 
-        # --- explicit scalar+tag feature ----------------------------------- #
-        f = torch.stack(feats)           # (B, feat_dim)
+        # ---------------------- 2.  CODE (solution) ----------------------- #
+        enc_c = self.code_tok(
+            list(codes),
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_lc - 3,      # leave room for 2×CLS + SEP
+            padding=True,
+            return_tensors="pt",
+        )
+        prefix_code = torch.full((B, 2), self.cls_id_code, dtype=torch.long)
+        sep_code    = torch.full((B, 1), self.sep_id_code,  dtype=torch.long)
 
-        return (text["input_ids"],  text["attention_mask"],
-                code["input_ids"], code["type_ids"], code["attention_mask"],
-                f,
-                torch.tensor(labels))
+        code_ids  = torch.cat([prefix_code, enc_c["input_ids"], sep_code], dim=1)
+        code_mask = torch.cat(
+            [torch.ones_like(prefix_code), enc_c["attention_mask"], torch.ones_like(sep_code)],
+            dim=1,
+        )
+        code_type = torch.zeros_like(code_ids)        # JOERN type-ids not used
+
+        # ---------------------- 3.  Explicit features --------------------- #
+        explicit_feats = torch.stack(feats)            # (B, feat_dim)
+
+        return (
+            text_ids,
+            text_mask,
+            code_ids,
+            code_type,
+            code_mask,
+            explicit_feats,
+            torch.tensor(labels),
+        )
 
 # --------------------------------------------------------------------------- #
 #                   2.  Utility                                               #
@@ -97,21 +135,22 @@ def main():
 
     # ① Dataset & dataloader
     train_ds = CodeContestsDataset(subset=args.subset, split="train", seed=args.seed)
-    val_ds   = CodeContestsDataset(subset=args.subset, split="validation", seed=args.seed)
+    val_ds   = CodeContestsDataset(subset=args.subset, split="valid", seed=args.seed)
 
     txt_tok  = AutoTokenizer.from_pretrained("bert-base-uncased")
     code_tok = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 
+    num_workers = 0
     feat_dim = 3 + train_ds.n_tags             # time, mem, io + multi-hot tags
     collate  = Collator(txt_tok, code_tok,
                         args.max_len_text, args.max_len_code, feat_dim)
     train_ld = DataLoader(train_ds, batch_size=args.bsz, shuffle=True,
-                          collate_fn=collate, num_workers=4, pin_memory=True)
+                          collate_fn=collate, num_workers=num_workers, pin_memory=True)
     val_ld   = DataLoader(val_ds,   batch_size=args.bsz, shuffle=False,
-                          collate_fn=collate, num_workers=4, pin_memory=True)
+                          collate_fn=collate, num_workers=num_workers, pin_memory=True)
 
     # ② Model (num_labels = max difficulty id + 1)
-    num_labels = max(ex[-1] for ex in train_ds.data) + 1
+    num_labels = max(ex[-1] for ex in train_ds) + 1
     model = CBERT(num_labels)
     # classifier 첫 층 입력크기 수정 (D*2 + feat_dim)
     D = model.text.config.hidden_size

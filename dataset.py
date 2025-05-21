@@ -126,8 +126,8 @@ class CodeContestsDataset(TorchDataset):
         
         # ── ① 모든 Codeforces 문제에서 tag vocabulary 수집
         tag_set = set()
-        for ex in self.data:
-            for t in ex.get("cf_tags", []):
+        for ex in self.data["cf_tags"]:
+            for t in ex:
                 tag_set.add(t.lower())
         self.tag2idx: Dict[str, int] = {t: i for i, t in enumerate(sorted(tag_set))}
         self.n_tags = len(self.tag2idx)
@@ -135,7 +135,7 @@ class CodeContestsDataset(TorchDataset):
     # ──────────────────────────────────────────────────────────────────────── #
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.data["cf_tags"])
 
     # ──────────────────────────────────────────────────────────────────────── #
 
@@ -189,6 +189,8 @@ class CodeContestsDataset(TorchDataset):
 
         # ----  x1 : ONE correct solution (comments stripped)  ---- #
         sols = ex["solutions"]
+        if len(sols["solution"]) == 0:
+            return "", "", None, -1
         j = self.rng.randrange(len(sols["solution"]))
         raw_sol, lang_id = sols["solution"][j], sols["language"][j]
         clean_sol = _strip_comments(raw_sol, lang_id).strip()
