@@ -123,6 +123,14 @@ class CodeContestsDataset(TorchDataset):
 
         # ⚠  store as Python list for fast random access by index
         self.data: List[Dict] = ds.with_format("python")[:]
+        
+        # ── ① 모든 Codeforces 문제에서 tag vocabulary 수집
+        tag_set = set()
+        for ex in self.data:
+            for t in ex.get("cf_tags", []):
+                tag_set.add(t.lower())
+        self.tag2idx: Dict[str, int] = {t: i for i, t in enumerate(sorted(tag_set))}
+        self.n_tags = len(self.tag2idx)
 
     # ──────────────────────────────────────────────────────────────────────── #
 
@@ -131,29 +139,32 @@ class CodeContestsDataset(TorchDataset):
 
     # ──────────────────────────────────────────────────────────────────────── #
 
+    def _encode_tags(self, tags: List[str]) -> torch.Tensor:
+        vec = torch.zeros(self.n_tags, dtype=torch.float32)
+        for t in tags:
+            i = self.tag2idx.get(t.lower())
+            if i is not None:
+                vec[i] = 1.0
+        return vec
+    
     def _build_feature_vector(self, ex: Dict) -> torch.Tensor:
-        # (1) time limit  ► seconds + nanos·1e-9
+        # (1)-(3) 기존 스칼라
         time_limit = ex.get("time_limit") or {"seconds": 0, "nanos": 0}
         time_sec = time_limit["seconds"] + time_limit["nanos"] / 1e9
-
-        # (2) memory limit ► MB
         mem_mb = ex.get("memory_limit_bytes", 0) / 1_000_000.0
-
-        # (3) size of public I/O  ► mean bytes across examples
-        inputs = ex["public_tests"]["input"]
-        outputs = ex["public_tests"]["output"]
-        avg_io_bytes = (
-            (
-                sum(len(s.encode()) for s in inputs)
-                + sum(len(s.encode()) for s in outputs)
-            )
+        inputs, outputs = ex["public_tests"]["input"], ex["public_tests"]["output"]
+        avg_io = (
+            (sum(len(s.encode()) for s in inputs) +
+             sum(len(s.encode()) for s in outputs))
             / max(len(inputs) + len(outputs), 1)
         )
 
-        # (4) category label  ► original integer `source`
-        cat = ex["source"]
+        scalar = torch.tensor([time_sec, mem_mb, avg_io], dtype=torch.float32)
 
-        return torch.tensor([time_sec, mem_mb, avg_io_bytes, float(cat)])
+        # (4) Codeforces tags → multi-hot, else 0-vector
+        tag_vec = self._encode_tags(ex.get("cf_tags", []))
+
+        return torch.cat((scalar, tag_vec))
 
     # ──────────────────────────────────────────────────────────────────────── #
 
