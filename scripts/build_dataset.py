@@ -68,7 +68,9 @@ def cf_get(endpoint: str, rate: Optional[RateLimiter] = None, **params):
     return data["result"]
 
 def get_problemset() -> List[Dict[str, Any]]:
-    return [p for p in cf_get("problemset.problems") ["problems"] if "rating" in p]
+    a = cf_get("problemset.problems")
+    print(a)
+    return [p for p in a["problems"] if "rating" in p]
 
 def fetch_solution(contest_id: int, index: str, api_key: str, api_secret: str,
                    rate: RateLimiter) -> str:
@@ -101,6 +103,7 @@ def build_codeforces(out_path: Path, api_key: Optional[str], api_secret: Optiona
 
     samples: Dict[str, Dict[str, Any]] = {}
     for p in problems:
+        print(p)
         pid = f"{p['contestId']}{p['index']}"
         samples[pid] = {
             "problem_id": pid,
@@ -156,8 +159,8 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path)
     parser.add_argument("--raw_dir", type=Path)
     parser.add_argument("--limit", type=int, default=2000)
-    parser.add_argument("--api_key")
-    parser.add_argument("--api_secret")
+    parser.add_argument("--api_key", default="37151fb6093d04f78a02079edadc106bb38a22e5")
+    parser.add_argument("--api_secret", default="83a7b38773cce64091c285a1ed3fd30dce414b62")
     parser.add_argument("--workers", type=int, default=8, help="parallel threads (CF)")
     args = parser.parse_args()
 
