@@ -1,103 +1,163 @@
-"""Training with tqdm progress bars **and Weights & Biases logging**."""
-import argparse, os, torch, wandb
-from torch.utils.data import DataLoader, Subset
-from transformers import get_linear_schedule_with_warmup
-from sklearn.model_selection import StratifiedKFold
-from tqdm import tqdm
+# train.py
+import argparse, os, math, random
+from pathlib import Path
+from typing import Dict, List, Tuple
 
-from config import cfg
-from dataset import PojDataset
-from model import CBERT
-from utils.seed import set_seed
-from utils.metrics import calc_metrics
+import torch, torch.nn as nn
+from torch.utils.data import DataLoader
 
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
-def train_fold(dataset_path, fold_idx, splits, num_labels):
-    set_seed(cfg.seed + fold_idx)
+from dataset import CodeContestsDataset                        # ← user file
+from model   import CBERT                                      # ← user file
+# --------------------------------------------------------------------------- #
+#                   0.  Argument parsing                                      #
+# --------------------------------------------------------------------------- #
+def get_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--subset", default="codeforces",
+                   choices=["all", "codeforces", "codechef"])
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--bsz",    type=int, default=8)
+    p.add_argument("--lr",     type=float, default=2e-5)
+    p.add_argument("--max_len_text", type=int, default=256)
+    p.add_argument("--max_len_code", type=int, default=256)
+    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--seed",   type=int, default=42)
+    return p.parse_args()
 
-    model = CBERT(num_labels).to(cfg.device)
-    if fold_idx == 0:
-        wandb.watch(model, log="all", log_freq=100)
+# --------------------------------------------------------------------------- #
+#                   1.  Collate fn                                            #
+# --------------------------------------------------------------------------- #
+class Collator:
+    def __init__(self, txt_tok, code_tok,
+                 max_lt: int, max_lc: int, feat_dim: int):
+        self.txt_tok, self.code_tok = txt_tok, code_tok
+        self.max_lt, self.max_lc = max_lt, max_lc
+        self.feat_dim = feat_dim
+        self.cls_id_txt  = txt_tok.cls_token_id
+        self.sep_id_txt  = txt_tok.sep_token_id
+        self.cls_id_code = code_tok.cls_token_id
+        self.sep_id_code = code_tok.sep_token_id
 
-    train_idx, val_idx = splits[fold_idx]
-    train_set = Subset(PojDataset(dataset_path), train_idx)
-    val_set = Subset(PojDataset(dataset_path), val_idx)
+    def __call__(self, batch):
+        descs, codes, feats, labels = zip(*batch)
 
-    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=cfg.batch_size)
+        # --- text prompt --------------------------------------------------- #
+        t = self.txt_tok(list(descs), add_special_tokens=False,
+                         truncation=True, max_length=self.max_lt-3)
+        text_ids  = []
+        text_mask = []
+        for ids, attn in zip(t["input_ids"], t["attention_mask"]):
+            ids = [self.cls_id_txt, self.cls_id_txt] + ids + [self.sep_id_txt]
+            mask= [1]*len(ids)
+            text_ids.append(ids)
+            text_mask.append(mask)
+        text = self.txt_tok.pad(
+            {"input_ids":text_ids, "attention_mask":text_mask},
+            padding="longest", return_tensors="pt")
 
-    optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    total_steps = len(train_loader) * cfg.epochs
-    sched = get_linear_schedule_with_warmup(optim, int(total_steps * cfg.warmup_ratio), total_steps)
+        # --- code solution -------------------------------------------------- #
+        c = self.code_tok(list(codes), add_special_tokens=False,
+                          truncation=True, max_length=self.max_lc-3)
+        code_ids, code_mask, code_type = [], [], []
+        for ids, attn in zip(c["input_ids"], c["attention_mask"]):
+            ids = [self.cls_id_code, self.cls_id_code] + ids + [self.sep_id_code]
+            mask= [1]*len(ids)
+            tpe = [0]*len(ids)           # JOERN 타입 정보 없음 → 0
+            code_ids.append(ids)
+            code_mask.append(mask)
+            code_type.append(tpe)
+        code = self.code_tok.pad(
+            {"input_ids":code_ids, "attention_mask":code_mask},
+            padding="longest", return_tensors="pt")
+        code["type_ids"] = torch.tensor(
+            [seq + [0]*(code["input_ids"].size(1)-len(seq)) for seq in code_type])
 
-    best_f1 = 0.0
-    os.makedirs(cfg.log_dir, exist_ok=True)
-    ckpt_path = os.path.join(cfg.log_dir, f"models/model_fold{fold_idx}.pt")
+        # --- explicit scalar+tag feature ----------------------------------- #
+        f = torch.stack(feats)           # (B, feat_dim)
 
-    global_step = 0
-    for epoch in range(cfg.epochs):
-        # ---------------- training ----------------
+        return (text["input_ids"],  text["attention_mask"],
+                code["input_ids"], code["type_ids"], code["attention_mask"],
+                f,
+                torch.tensor(labels))
+
+# --------------------------------------------------------------------------- #
+#                   2.  Utility                                               #
+# --------------------------------------------------------------------------- #
+def set_seed(s):
+    random.seed(s); torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+# --------------------------------------------------------------------------- #
+#                   3.  Main                                                  #
+# --------------------------------------------------------------------------- #
+def main():
+    args = get_args(); set_seed(args.seed)
+    dev = torch.device(args.device)
+
+    # ① Dataset & dataloader
+    train_ds = CodeContestsDataset(subset=args.subset, split="train", seed=args.seed)
+    val_ds   = CodeContestsDataset(subset=args.subset, split="validation", seed=args.seed)
+
+    txt_tok  = AutoTokenizer.from_pretrained("bert-base-uncased")
+    code_tok = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+
+    feat_dim = 3 + train_ds.n_tags             # time, mem, io + multi-hot tags
+    collate  = Collator(txt_tok, code_tok,
+                        args.max_len_text, args.max_len_code, feat_dim)
+    train_ld = DataLoader(train_ds, batch_size=args.bsz, shuffle=True,
+                          collate_fn=collate, num_workers=4, pin_memory=True)
+    val_ld   = DataLoader(val_ds,   batch_size=args.bsz, shuffle=False,
+                          collate_fn=collate, num_workers=4, pin_memory=True)
+
+    # ② Model (num_labels = max difficulty id + 1)
+    num_labels = max(ex[-1] for ex in train_ds.data) + 1
+    model = CBERT(num_labels)
+    # classifier 첫 층 입력크기 수정 (D*2 + feat_dim)
+    D = model.text.config.hidden_size
+    model.classifier[0] = nn.Linear(D*2 + feat_dim, D)
+    model = model.to(dev)
+
+    # ③ Optim / sched / loss
+    opt  = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    total_steps = len(train_ld) * args.epochs
+    sched = get_cosine_schedule_with_warmup(opt,
+                num_warmup_steps=int(0.05*total_steps),
+                num_training_steps=total_steps)
+    crit = nn.CrossEntropyLoss()
+
+    # ④ Train loop
+    for ep in range(1, args.epochs+1):
         model.train()
-        bar = tqdm(train_loader, desc=f"Fold {fold_idx} | Epoch {epoch} [train]", leave=False)
-        for text_in, code_in, feat, label in bar:
-            text_in = {k: v.to(cfg.device) for k, v in text_in.items()}
-            code_in = {k: v.to(cfg.device) for k, v in code_in.items()}
-            feat, label = feat.to(cfg.device), label.to(cfg.device)
+        tot_loss, tot = 0.0, 0
+        for batch in train_ld:
+            (tid, tmask, cid, ctype, cmask, feat, y) = [x.to(dev) for x in batch]
+            opt.zero_grad()
+            logits = model(tid, tmask, cid, ctype, cmask, feat)
+            loss = crit(logits, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step(); sched.step()
+            tot_loss += loss.item()*y.size(0); tot += y.size(0)
+        print(f"[E{ep}] train loss {tot_loss/tot:.4f}")
 
-            logits = model(text_in, code_in, feat)
-            loss = torch.nn.functional.cross_entropy(logits, label)
-            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optim.step(); sched.step(); optim.zero_grad()
-            bar.set_postfix(loss=f"{loss.item():.4f}")
-
-            if global_step % 100 == 0:
-                wandb.log({f"fold{fold_idx}/train_loss": loss.item(), "step": global_step})
-            global_step += 1
-
-        # ---------------- validation --------------
-        model.eval(); all_logits, all_labels = [], []
+        # ---- validation --------------------------------------------------- #
+        model.eval()
+        correct, total = 0, 0
         with torch.no_grad():
-            for text_in, code_in, feat, label in tqdm(val_loader, desc=f"Fold {fold_idx} | Epoch {epoch} [val]", leave=False):
-                text_in = {k: v.to(cfg.device) for k, v in text_in.items()}
-                code_in = {k: v.to(cfg.device) for k, v in code_in.items()}
-                feat, label = feat.to(cfg.device), label.to(cfg.device)
-                all_logits.append(model(text_in, code_in, feat).cpu())
-                all_labels.append(label.cpu())
-        metrics = calc_metrics(torch.cat(all_logits), torch.cat(all_labels), num_labels)
-        wandb.log({f"fold{fold_idx}/val_acc": metrics['acc'],
-                   f"fold{fold_idx}/val_f1": metrics['f1'],
-                   f"fold{fold_idx}/val_auc": metrics['auc'],
-                   "epoch": epoch})
-        print(f"Fold {fold_idx} | Epoch {epoch} → ACC {metrics['acc']:.4f} F1 {metrics['f1']:.4f} AUC {metrics['auc']:.4f}")
-        if metrics['f1'] > best_f1:
-            best_f1 = metrics['f1']; torch.save(model.state_dict(), ckpt_path)
-            print("  ↳ new best model saved")
+            for batch in val_ld:
+                (tid, tmask, cid, ctype, cmask, feat, y) = [x.to(dev) for x in batch]
+                logits = model(tid, tmask, cid, ctype, cmask, feat)
+                pred = logits.argmax(-1)
+                correct += (pred==y).sum().item()
+                total   += y.size(0)
+        acc = correct/total if total else 0
+        print(f"[E{ep}] valid acc  {acc:.3%}")
 
-# ---------------- splitting util ----------------
-def build_splits(dataset_path, n_splits):
-    dset = PojDataset(dataset_path)
-    labels = [s['label'] for s in dset.samples]
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=cfg.seed)
-    return list(skf.split(range(len(dset)), labels))
+        # ---- checkpoint --------------------------------------------------- #
+        ckpt = f"ckpt_epoch{ep}.pt"
+        torch.save(model.state_dict(), ckpt)
+        print(f"saved → {ckpt}")
 
-# -------------------------- CLI ----------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["codeforces", "codechef"], required=True)
-    parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--wandb_project", default=os.getenv("WANDB_PROJECT", "cbert"))
-    parser.add_argument("--wandb_name", default=None)
-    args = parser.parse_args()
-
-    # init wandb
-    wandb.init(project=args.wandb_project,
-               name=args.wandb_name or f"{args.dataset}_folds{args.folds}",
-               config={**cfg.__dict__, "dataset": args.dataset, "folds": args.folds})
-
-    cfg.num_labels = 3 if args.dataset == "codeforces" else 5
-    data_path = os.path.join("data", f"{args.dataset}.jsonl")
-    splits = build_splits(data_path, args.folds)
-    for fid in range(args.folds):
-        train_fold(data_path, fid, splits, cfg.num_labels)
-
-    wandb.finish()
+    main()
