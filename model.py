@@ -77,35 +77,39 @@ class CrossLayer(nn.Module):
         self.self_attn = CustomSelfAttention(cfg)
         self.qout      = bert_layer.attention.output.dense
         self.q_ln      = bert_layer.attention.output.LayerNorm          
+        self.dropout   = nn.Dropout(cfg.hidden_dropout_prob)
         
-        # build the MoE, replace the dense FFN
-        self.moe = MoE (
-            hidden_size = cfg.hidden_size,
-            expert = FeedForwardExpert(
-                cfg.hidden_size, 
-                cfg.intermediate_size, 
-                activation = nn.functional.gelu
-            ),
-            num_experts= num_experts,
-            k = top_k,
-        )
+        # FFN or MoE? (cfg.use_moe)
+        self.use_moe = getattr(cfg, "use_moe", False)
+        
+        if self.use_moe:
+            # build the MoE, replace the dense FFN
+            self.moe = MoE (
+                hidden_size = cfg.hidden_size,
+                expert = FeedForwardExpert(
+                    cfg.hidden_size, 
+                    cfg.intermediate_size, 
+                    activation = nn.functional.gelu
+                ),
+                num_experts= num_experts,
+                k = top_k,
+            )        
+            # warm-start every expert from the dense FFN
+            for exp in self.moe.experts:
+                exp.fc1.weight.data.copy_(bert_layer.intermediate.dense.weight)
+                exp.fc1.bias.data.copy_(bert_layer.intermediate.dense.bias)
+                exp.fc2.weight.data.copy_(bert_layer.output.dense.weight)
+                exp.fc2.bias.data.copy_(bert_layer.output.dense.bias)\
+                    
+        else:
+            # just use regular FFN
+            self.inter     = bert_layer.intermediate
+            self.out       = bert_layer.output.dense
+            self.act_fn    = self.inter.intermediate_act_fn
+    
         self.out_ln = bert_layer.output.LayerNorm
         
-        # # FFN
-        # self.inter     = bert_layer.intermediate
-        # self.out       = bert_layer.output.dense
-        # self.out_ln    = bert_layer.output.LayerNorm
-        # self.dropout   = nn.Dropout(cfg.hidden_dropout_prob)
-        # self.act_fn    = self.inter.intermediate_act_fn
-        
-        # (optional) copy pretrained dense weights into every expert
-        for exp in self.moe.experts:
-            exp.fc1.weight.data.copy_(bert_layer.intermediate.dense.weight)
-            exp.fc1.bias.data.copy_(bert_layer.intermediate.dense.bias)
-            exp.fc2.weight.data.copy_(bert_layer.output.dense.weight)
-            exp.fc2.bias.data.copy_(bert_layer.output.dense.bias)
-        
-        # weight copy
+        # attention weight copy
         for tgt, src in [
             (self.self_attn.query, bert_layer.attention.self.query),
             (self.self_attn.key,   bert_layer.attention.self.key),
@@ -118,11 +122,15 @@ class CrossLayer(nn.Module):
         # Self-Attention (with Q-swap)
         attn_out = self.self_attn(x, attn_mask, cross_cls)
         x = self.q_ln(x + self.dropout(self.qout(attn_out)))
-        # # FFN
-        # ffn = self.act_fn(self.inter(x))
-        # x = self.out_ln(x + self.dropout(self.out(ffn)))
-        moe_out, moe_loss, _ = self.moe(x)          # DeepSpeed returns (y, loss, counts)
-        x = self.out_ln(x + self.dropout(moe_out))
+        
+        # feedforward sublayer
+        if self.use_moe:
+            ffn_out, moe_loss, _ = self.moe(x)          # (B,L,D)
+            x = self.out_ln(x + self.dropout(ffn_out))
+        else:
+            ffn_out = self.act_fn(self.inter(x))
+            x = self.out_ln(x + self.dropout(self.out(ffn_out)))
+            moe_loss = x.new_zeros(())                  # MoE loss is unused: fill with scalar 0
         return x, moe_loss
 
 def convert_to_cross_encoder(model):
@@ -132,13 +140,6 @@ def convert_to_cross_encoder(model):
         new_layers.append(CrossLayer(layer, model.config))
     model.encoder.layer = new_layers
     return model
-
-# ────────────────────────────────────────────────────────────────────────────
-model = AutoModel.from_pretrained("bert-base-uncased")
-for layer in model.encoder.layer:
-    print(type(layer))
-# ────────────────────────────────────────────────────────────────────────────
-    
 
 # ────────────────────────────────────────────────────────────────────────────
 # 3.  C-BERT main module
