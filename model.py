@@ -57,19 +57,54 @@ class CustomSelfAttention(nn.Module):
 # ────────────────────────────────────────────────────────────────────────────
 # 2.  Transformer layer wrapper:  Self-Attention(Q-swap) + FFN
 # ────────────────────────────────────────────────────────────────────────────
+from deepspeed.moe.layer import MoE
+class FeedForwardExpert(nn.Module):
+    # exactly the same hidden sizes as the old FFN
+    def __init__(self, hidden_size, intermediate_size, activation):
+        super().__init__(hidden_size, intermediate_size, activation)
+        self.fc1 = nn.Linear(hidden_size, intermediate_size)
+        self.act = activation
+        self.fc2 = nn.Linear(intermediate_size, hidden_size)
+
+    def forward(self, x):
+        # x: (batch, seq_len, hidden_size)
+        return self.fc2(self.act(self.fc1(x)))
+
 class CrossLayer(nn.Module):
-    def __init__(self, bert_layer, cfg):
+    def __init__(self, bert_layer, cfg, num_experts = 8, top_k = 2):
         super().__init__()
         # self-attention
         self.self_attn = CustomSelfAttention(cfg)
         self.qout      = bert_layer.attention.output.dense
-        self.q_ln      = bert_layer.attention.output.LayerNorm
-        # FFN
-        self.inter     = bert_layer.intermediate
-        self.out       = bert_layer.output.dense
-        self.out_ln    = bert_layer.output.LayerNorm
-        self.dropout   = nn.Dropout(cfg.hidden_dropout_prob)
-        self.act_fn    = self.inter.intermediate_act_fn
+        self.q_ln      = bert_layer.attention.output.LayerNorm          
+        
+        # build the MoE, replace the dense FFN
+        self.moe = MoE (
+            hidden_size = cfg.hidden_size,
+            expert = FeedForwardExpert(
+                cfg.hidden_size, 
+                cfg.intermediate_size, 
+                activation = nn.functional.gelu
+            ),
+            num_experts= num_experts,
+            k = top_k,
+        )
+        self.out_ln = bert_layer.output.LayerNorm
+        
+        # # FFN
+        # self.inter     = bert_layer.intermediate
+        # self.out       = bert_layer.output.dense
+        # self.out_ln    = bert_layer.output.LayerNorm
+        # self.dropout   = nn.Dropout(cfg.hidden_dropout_prob)
+        # self.act_fn    = self.inter.intermediate_act_fn
+        
+        # (optional) copy pretrained dense weights into every expert
+        for exp in self.moe.experts:
+            exp.fc1.weight.data.copy_(bert_layer.intermediate.dense.weight)
+            exp.fc1.bias.data.copy_(bert_layer.intermediate.dense.bias)
+            exp.fc2.weight.data.copy_(bert_layer.output.dense.weight)
+            exp.fc2.bias.data.copy_(bert_layer.output.dense.bias)
+        
         # weight copy
         for tgt, src in [
             (self.self_attn.query, bert_layer.attention.self.query),
@@ -83,10 +118,12 @@ class CrossLayer(nn.Module):
         # Self-Attention (with Q-swap)
         attn_out = self.self_attn(x, attn_mask, cross_cls)
         x = self.q_ln(x + self.dropout(self.qout(attn_out)))
-        # FFN
-        ffn = self.act_fn(self.inter(x))
-        x = self.out_ln(x + self.dropout(self.out(ffn)))
-        return x
+        # # FFN
+        # ffn = self.act_fn(self.inter(x))
+        # x = self.out_ln(x + self.dropout(self.out(ffn)))
+        moe_out, moe_loss, _ = self.moe(x)          # DeepSpeed returns (y, loss, counts)
+        x = self.out_ln(x + self.dropout(moe_out))
+        return x, moe_loss
 
 def convert_to_cross_encoder(model):
     """Replace every BertLayer with CrossLayer in-place."""
@@ -95,6 +132,13 @@ def convert_to_cross_encoder(model):
         new_layers.append(CrossLayer(layer, model.config))
     model.encoder.layer = new_layers
     return model
+
+# ────────────────────────────────────────────────────────────────────────────
+model = AutoModel.from_pretrained("bert-base-uncased")
+for layer in model.encoder.layer:
+    print(type(layer))
+# ────────────────────────────────────────────────────────────────────────────
+    
 
 # ────────────────────────────────────────────────────────────────────────────
 # 3.  C-BERT main module
