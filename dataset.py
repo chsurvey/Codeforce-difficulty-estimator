@@ -6,6 +6,8 @@ import tokenize
 from datasets import load_dataset, Dataset
 import torch
 from torch.utils.data import Dataset as TorchDataset
+import pandas as pd
+import json
 
 __all__ = ["CodeContestsDataset"]
 
@@ -116,14 +118,22 @@ class CodeContestsDataset(TorchDataset):
 
         # load once → filter once → keep in memory as standard dict list
         ds: Dataset = load_dataset(self._HF_NAME, split=split)
-
+        tokenized_solution = json.load("~/playground/data/"+subset+"/solutions.json")
+        
         if subset != "all":
             keep_id = 2 if subset == "codeforces" else 1  # cf=2, cc=1
             ds = ds.filter(lambda ex: ex["source"] == keep_id)
 
         # ⚠  store as Python list for fast random access by index
         self.data: List[Dict] = ds.with_format("python")[:]
-        
+        self.data["code_token"] = []
+        self.data["code_type"] = []
+        for idx, name in enumerate(self.data["name"]):
+            c_token = tokenized_solution[name]["token"]
+            c_type = tokenized_solution[name]["type"]
+            self.data["code_token"].append(c_token)
+            self.data["code_type"].append(c_type)
+            
         # ── ① 모든 Codeforces 문제에서 tag vocabulary 수집
         tag_set = set()
         for ex in self.data["cf_tags"]:
@@ -177,15 +187,9 @@ class CodeContestsDataset(TorchDataset):
     def __getitem__(self, idx: int) -> Tuple[str, str, torch.Tensor, int]:
         ex = {key:self.data[key][idx] for key in self.data.keys()}
 
+        token2type = self.data["token2type"][idx]
         # ----  x0 : description + public tests (inputs + outputs)  ---- #
         desc = ex["description"].strip()
-        pub_in = "\n".join(ex["public_tests"]["input"])
-        pub_out = "\n".join(ex["public_tests"]["output"])
-        prompt = (
-            f"{desc}\n\n"
-            f"### Public Input\n{pub_in}\n"
-            f"### Expected Output\n{pub_out}"
-        )
 
         # ----  x1 : ONE correct solution (comments stripped)  ---- #
         sols = ex["solutions"]
@@ -193,7 +197,6 @@ class CodeContestsDataset(TorchDataset):
             return "", "", None, -1
         j = self.rng.randrange(len(sols["solution"]))
         raw_sol, lang_id = sols["solution"][j], sols["language"][j]
-        clean_sol = _strip_comments(raw_sol, lang_id).strip()
 
         # ----  x2 : scalar feature vector  ---- #
         feat_vec = self._build_feature_vector(ex)
@@ -201,4 +204,4 @@ class CodeContestsDataset(TorchDataset):
         # ----  y : difficulty label  ---- #
         difficulty = self._compute_difficulty(ex)
 
-        return prompt, clean_sol, feat_vec, difficulty
+        return desc, raw_sol, token2type, feat_vec, difficulty

@@ -7,6 +7,7 @@ class CFG:
     max_len_text = 512
     max_len_code = 512
     num_labels = 3
+    num_code_types = 10
 
     # optimization
     lr = 2e-5

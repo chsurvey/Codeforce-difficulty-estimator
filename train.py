@@ -10,6 +10,7 @@ from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from dataset import CodeContestsDataset                        # ← user file
 from model   import CBERT                                      # ← user file
+from config import cfg
 # --------------------------------------------------------------------------- #
 #                   0.  Argument parsing                                      #
 # --------------------------------------------------------------------------- #
@@ -67,7 +68,7 @@ class Collator:
         if not batch:                          # ← 전체가 드롭된 rare 케이스
             return None                        #   train loop에서 skip
         
-        descs, codes, feats, labels = zip(*batch)
+        descs, codes, type_mappings, feats, labels = zip(*batch)
         B = len(batch)
 
         # ---------------------- 1.  TEXT (prompt) ------------------------- #
@@ -105,8 +106,27 @@ class Collator:
             [torch.ones_like(prefix_code), enc_c["attention_mask"], torch.ones_like(sep_code)],
             dim=1,
         )
-        code_type = torch.zeros_like(code_ids)        # JOERN type-ids not used
+        _, L = code_ids.size()
+        device = code_ids.device
 
+        type_tensors = []
+        for b in range(B):
+            code = codes[b]                # (L,)  토큰 ID 시퀀스
+            mapping = type_mappings[b]           # dict {token_id: type_id}
+            code = "[CLS]"+code+"[SEP]"
+            # ① 토큰 ID → 타입 ID 매핑 (없으면 0)
+            t = torch.tensor([mapping.get(c_token, 0)  for c_token in self.code_tok.tokenize(code)],
+                            dtype=torch.long,
+                            device=device)
+
+            # ② 필요하면 특수 토큰(CLS×2, SEP) 수동 지정
+            # CLS_TYPE, SEP_TYPE = 0, 0  # 그대로 두거나 새 번호 부여
+            # t[0:2] = CLS_TYPE
+            # t[-1]  = SEP_TYPE
+
+            type_tensors.append(t)
+
+        code_type = torch.stack(type_tensors, dim=0)   # (B, L)
         # ---------------------- 3.  Explicit features --------------------- #
         explicit_feats = torch.stack(feats)            # (B, feat_dim)
 
@@ -151,7 +171,7 @@ def main():
 
     # ② Model (num_labels = max difficulty id + 1)
     num_labels = max(ex[-1] for ex in train_ds) + 1
-    model = CBERT(num_labels)
+    model = CBERT(num_labels, cfg.num_code_types)
     # classifier 첫 층 입력크기 수정 (D*2 + feat_dim)
     D = model.text.config.hidden_size
     model.classifier[0] = nn.Linear(D*2 + feat_dim, D)
