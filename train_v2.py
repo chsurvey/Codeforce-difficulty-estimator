@@ -1,161 +1,190 @@
-# DataParallel version: one process, multi-GPU via nn.DataParallel
-# -------------------------------------------------------------
-# 실행 예)   python train_dp.py   # CUDA_VISIBLE_DEVICES=0,1,2,3 가정
-# -------------------------------------------------------------
+# train_val_dp_split.py
+import os
 
-import random, torch, torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+# -----------------------------------------------------------------
+import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset, random_split
 from transformers import (AutoTokenizer, AutoModel,
                           get_linear_schedule_with_warmup)
 from tqdm.auto import tqdm
+from sklearn.metrics import roc_auc_score
+import wandb
 from dataset import CodeContestsDataset
 
-# -------------------- Hyper-parameters -------------------- #
-BATCH          = 16   # *total* batch (DataParallel가 내부에서 분할)
-EPOCHS         = 5
-TXT_MAXLEN     = 512
-CODE_MAXLEN    = 512
-HIDDEN         = 768
-PROJ_DIM       = 256
-LR_ENCODER     = 2e-5
-LR_OTHER       = 1e-4
-GRAD_ACCUM     = 2
+# -----------------------------------------------------------------
+# 0.  wandb 세팅
+# -----------------------------------------------------------------
+wandb.init(project="codecontest-contrastive")
 
+# -----------------------------------------------------------------
+# 1. 하이퍼파라미터
+# -----------------------------------------------------------------
+BATCH, EPOCHS           = 64, 20
+VAL_RATIO               = 0.10        # train : val  =  0.9 : 0.1
+TXT_MAXLEN = CODE_MAXLEN = 512
+HIDDEN, PROJ_DIM        = 768, 256
+LR_ENCODER, LR_OTHER    = 2e-5, 1e-4
+GRAD_ACCUM, TEMP        = 2, 0.07
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# -------------------- Tokenizer & Encoder ------------------ #
-
+# -----------------------------------------------------------------
+# 2. 토크나이저 / 프리트레인 인코더
+# -----------------------------------------------------------------
 tok_txt  = AutoTokenizer.from_pretrained("bert-base-uncased")
 enc_txt  = AutoModel.from_pretrained("bert-base-uncased")
-
 tok_code = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 enc_code = AutoModel.from_pretrained("microsoft/codebert-base")
 
-# -------------------- Dataset Wrapper --------------------- #
+# -----------------------------------------------------------------
+# 3. 데이터셋
+# -----------------------------------------------------------------
 class PosPairDataset(Dataset):
-    """Return (description, solution, token2type) triplets."""
+    """(description, solution, token2type) 반환."""
     def __init__(self, split="train", seed=42):
-        self.inner = CodeContestsDataset(split=split, subset="codeforces", seed=seed)
+        self.inner = CodeContestsDataset(split=split, subset="codeforces",
+                                         seed=seed)
         all_ids = [tid for m in self.inner.data["token2type"] for tid in m.values()]
         self.n_types = max(all_ids, default=0) + 1
-    def __len__(self):
-        return len(self.inner)
+    def __len__(self):  return len(self.inner)
     def __getitem__(self, idx):
         desc, sol, token2type, *_ = self.inner[idx]
         return desc, sol, token2type
 
-# -------------------- Collate fn -------------------------- #
-
+# -----------------------------------------------------------------
 def collate(batch):
     descs, codes, maps = zip(*batch)
-    txt = tok_txt(list(descs), return_tensors="pt", padding=True,
-                  truncation=True, max_length=TXT_MAXLEN)
+    txt  = tok_txt (list(descs), return_tensors="pt", padding=True,
+                    truncation=True, max_length=TXT_MAXLEN)
+    code = tok_code(list(codes), return_tensors="pt", padding=True,
+                    truncation=True, max_length=CODE_MAXLEN)
 
-    code_tok = tok_code(list(codes), return_tensors="pt", padding=True,
-                        truncation=True, max_length=CODE_MAXLEN)
-
-    L = code_tok["input_ids"].shape[1]
-    type_tensors = []
-    for code_str, mapping in zip(codes, maps):
-        toks = tok_code.tokenize(code_str)
-        type_ids = [0, 0] + [mapping.get(t, 0) for t in toks][:CODE_MAXLEN-3] + [0]
-        if len(type_ids) < L:
-            type_ids += [0]*(L-len(type_ids))
-        else:
-            type_ids = type_ids[:L]
-        type_tensors.append(torch.tensor(type_ids, dtype=torch.long))
-    code_type = torch.stack(type_tensors)
-
+    L = code["input_ids"].shape[1]
+    type_mat = []
+    for cstr, mapping in zip(codes, maps):
+        toks = tok_code.tokenize(cstr, truncation=True, max_length=CODE_MAXLEN)
+        ids  = [0,0]+[mapping.get(t,0) for t in toks][:CODE_MAXLEN-3]+[0]
+        ids += [0]*(L-len(ids)) if len(ids)<L else []
+        type_mat.append(torch.tensor(ids[:L], dtype=torch.long))
     return (txt["input_ids"], txt["attention_mask"],
-            code_tok["input_ids"], code_tok["attention_mask"],
-            code_type)
+            code["input_ids"], code["attention_mask"],
+            torch.stack(type_mat))
 
-# -------------------- Model ------------------------------- #
+# -----------------------------------------------------------------
+# 4. 모델
+# -----------------------------------------------------------------
 class Projection(nn.Module):
     def __init__(self, in_dim=HIDDEN, out_dim=PROJ_DIM):
         super().__init__()
-        self.proj = nn.Sequential(nn.Linear(in_dim, out_dim), nn.Tanh())
-    def forward(self, x):
-        return self.proj(x)
+        self.proj = nn.Sequential(nn.Linear(in_dim,in_dim), nn.ReLU(),
+                                  nn.Linear(in_dim,out_dim))
+    def forward(self,x): return self.proj(x)
 
 class ContrastiveModel(nn.Module):
-    def __init__(self, n_types: int):
+    def __init__(self, n_types:int):
         super().__init__()
-        self.txt_enc   = enc_txt
-        self.code_enc  = enc_code
-        self.type_emb  = nn.Embedding(n_types, HIDDEN, padding_idx=0)
-        self.proj_txt  = Projection()
-        self.proj_code = Projection()
-    def forward(self, txt_ids, txt_mask,
-                      code_ids, code_mask, type_ids):
-        txt_h   = self.txt_enc(input_ids=txt_ids, attention_mask=txt_mask).last_hidden_state
-        txt_vec = self.proj_txt(txt_h[:, 0])
+        self.txt_enc, self.code_enc = enc_txt, enc_code
+        self.type_emb = nn.Embedding(n_types,HIDDEN,padding_idx=0)
+        self.proj_txt, self.proj_code = Projection(), Projection()
+    def forward(self, txt_ids, txt_mask, code_ids, code_mask, type_ids):
+        tv = self.proj_txt(
+            self.txt_enc(input_ids=txt_ids, attention_mask=txt_mask)
+               .last_hidden_state[:,0])
+        cv = self.proj_code(
+            self.code_enc(input_ids=code_ids, attention_mask=code_mask)
+               .last_hidden_state[:,0])
+        return tv, cv
 
-        inputs_embeds = self.code_enc.embeddings(input_ids=code_ids).clone()
-        inputs_embeds = inputs_embeds + self.type_emb(type_ids.to(code_ids.device))
-        code_h = self.code_enc(inputs_embeds=inputs_embeds, attention_mask=code_mask).last_hidden_state
-        code_vec = self.proj_code(code_h[:, 0])
-        return txt_vec, code_vec
+# -----------------------------------------------------------------
+# 5. InfoNCE + metric
+# -----------------------------------------------------------------
+def info_nce(anchor, positive, temp=TEMP):
+    a, p = F.normalize(anchor, dim=1), F.normalize(positive, dim=1)
+    logits = a @ p.T / temp                       # (B,B)
+    labels = torch.arange(a.size(0), device=a.device)
+    loss   = F.cross_entropy(logits, labels)
 
-# -------------------- Training ---------------------------- #
+    with torch.no_grad():
+        acc = (logits.argmax(1)==labels).float().mean().item()
+        tgt = torch.eye(a.size(0), device=a.device).flatten()
+        try: auc = roc_auc_score(tgt.cpu(), logits.flatten().cpu())
+        except ValueError: auc = float('nan')
+    return loss, acc, auc
 
-def train():
-    ds = PosPairDataset(split="train", seed=0)
-    dl = DataLoader(ds, batch_size=BATCH, shuffle=True,
-                    num_workers=2, collate_fn=collate, pin_memory=True)
+# -----------------------------------------------------------------
+# 6. epoch 실행 함수 (p-bar 포함)
+# -----------------------------------------------------------------
+def run_epoch(model, loader, phase, optim=None, scaler=None,
+              scheduler=None, epoch=0):
+    training = optim is not None
+    model.train() if training else model.eval()
+    totL=totA=totU=0.0; n=0
+    pbar = tqdm(loader, desc=f"{phase} {epoch}", leave=False)
+    for batch in pbar:
+        (txt_ids, txt_mask, code_ids, code_mask, type_ids) = \
+            [x.to(device, non_blocking=True) for x in batch]
 
-    base_model = ContrastiveModel(n_types=ds.n_types).to(device)
-    model = nn.DataParallel(base_model)                # ➡ DataParallel
+        ctx = torch.cuda.amp.autocast() if training else torch.no_grad()
+        with ctx:
+            v_txt, v_pos = model(txt_ids, txt_mask,
+                                 code_ids, code_mask, type_ids)
+            loss, acc, auc = info_nce(v_txt, v_pos)
 
-    loss_fn = nn.CosineEmbeddingLoss()
+        if training:
+            scaler.scale(loss/GRAD_ACCUM).backward()
+            if (n+1) % GRAD_ACCUM == 0:
+                scaler.step(optim); scaler.update()
+                optim.zero_grad();  scheduler.step()
 
+        totL+=loss.item(); totA+=acc; totU+=0 if auc!=auc else auc; n+=1
+        pbar.set_postfix(L=f"{totL/n:.4f}", A=f"{totA/n:.3f}", U=f"{totU/max(1,n):.3f}")
+    return totL/n, totA/n, totU/max(1,n)
+
+# -----------------------------------------------------------------
+# 7. main
+# -----------------------------------------------------------------
+def main():
+    # --- 전체 train split 로드 후 90:10 분할
+    full_ds = PosPairDataset("train")
+    val_len = int(len(full_ds)*VAL_RATIO)
+    train_len = len(full_ds) - val_len
+    ds_tr, ds_va = random_split(full_ds, [train_len, val_len],
+                                generator=torch.Generator().manual_seed(42))
+    n_types = full_ds.n_types   # Subset엔 속성이 없으므로 따로 저장
+
+    dl_tr = DataLoader(ds_tr,batch_size=BATCH,shuffle=True,
+                       num_workers=2,collate_fn=collate,pin_memory=True)
+    dl_va = DataLoader(ds_va,batch_size=BATCH,shuffle=False,
+                       num_workers=2,collate_fn=collate,pin_memory=True)
+
+    model = nn.DataParallel(ContrastiveModel(n_types).to(device))
     optim = torch.optim.AdamW([
-        {"params": model.module.txt_enc.parameters(),  "lr": LR_ENCODER},
-        {"params": model.module.code_enc.parameters(), "lr": LR_ENCODER},
+        {"params":model.module.txt_enc.parameters(),"lr":LR_ENCODER},
+        {"params":model.module.code_enc.parameters(),"lr":LR_ENCODER},
         {"params": list(model.module.type_emb.parameters()) +
-                    list(model.module.proj_txt.parameters()) +
-                    list(model.module.proj_code.parameters()), "lr": LR_OTHER},
-    ], weight_decay=1e-2)
-
-    scheduler = get_linear_schedule_with_warmup(optim, len(dl)//10, len(dl)*EPOCHS)
+                   list(model.module.proj_txt.parameters()) +
+                   list(model.module.proj_code.parameters()), "lr":LR_OTHER}],
+        weight_decay=1e-2)
+    sched  = get_linear_schedule_with_warmup(optim,len(dl_tr)//10,
+                                             len(dl_tr)*EPOCHS)
     scaler = torch.cuda.amp.GradScaler()
 
-    for epoch in range(1, EPOCHS+1):
-        model.train(); running = 0.0
-        for step, batch in enumerate(tqdm(dl, desc=f"Epoch {epoch}")):
-            (txt_ids, txt_mask,
-             code_ids, code_mask,
-             type_ids) = [x.to(device, non_blocking=True) for x in batch]
+    for ep in range(1, EPOCHS+1):
+        trL,trA,trU = run_epoch(model, dl_tr, "train",
+                                optim, scaler, sched, ep)
+        vaL,vaA,vaU = run_epoch(model, dl_va, "val",  epoch=ep)
 
-            perm = torch.randperm(txt_ids.size(0), device=device)
-            txt_neg  = code_ids[perm].clone()
-            mask_neg = code_mask[perm].clone()
-            type_neg = type_ids[perm].clone()
+        wandb.log({"epoch":ep,
+                   "train/loss":trL,"train/acc":trA,"train/auc":trU,
+                   "val/loss":vaL,"val/acc":vaA,"val/auc":vaU})
+        print(f"[{ep}] train L{trL:.4f}|A{trA:.3f}|U{trU:.3f}  ||  "
+              f"val L{vaL:.4f}|A{vaA:.3f}|U{vaU:.3f}")
+    
+    # ---------- 모델 저장 ---------- #
+    os.makedirs("./models", exist_ok=True)
+    torch.save(model.module.state_dict(), "./models/contrastive_last.pt")
+    print("Saved to  ./models/contrastive_last.pt")
 
-            with torch.cuda.amp.autocast():
-                v_txt, v_pos = model(txt_ids, txt_mask,
-                                     code_ids, code_mask, type_ids)
-                _,     v_neg = model(txt_ids, txt_mask,
-                                     txt_neg, mask_neg, type_neg)
-                emb1   = torch.cat([v_txt, v_txt], dim=0)
-                emb2   = torch.cat([v_pos, v_neg], dim=0)
-                target = torch.cat([torch.ones(v_txt.size(0),  device=device),
-                                    -torch.ones(v_txt.size(0), device=device)])
-                loss = loss_fn(emb1, emb2, target)
-
-            scaler.scale(loss/GRAD_ACCUM).backward()
-
-            if (step+1) % GRAD_ACCUM == 0:
-                scaler.step(optim)
-                scaler.update()
-                optim.zero_grad()
-                scheduler.step()
-
-            running += loss.item()
-
-        print(f"[Epoch {epoch}] mean loss = {running/len(dl):.4f}")
-
-    print("Training done.  total type-vocab :", ds.n_types)
+    print("Done. type-vocab :", n_types); wandb.finish()
 
 if __name__ == "__main__":
-    train()
+    main()
