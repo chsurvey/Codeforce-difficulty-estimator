@@ -1,5 +1,6 @@
 # train_val_dp_split.py
 import os
+import math
 
 # -----------------------------------------------------------------
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -19,7 +20,7 @@ wandb.init(project="codecontest-contrastive")
 # -----------------------------------------------------------------
 # 1. 하이퍼파라미터
 # -----------------------------------------------------------------
-BATCH, EPOCHS           = 64, 20
+BATCH, EPOCHS           = 64, 30
 VAL_RATIO               = 0.10        # train : val  =  0.9 : 0.1
 TXT_MAXLEN = CODE_MAXLEN = 512
 HIDDEN, PROJ_DIM        = 768, 256
@@ -85,14 +86,24 @@ class ContrastiveModel(nn.Module):
         self.txt_enc, self.code_enc = enc_txt, enc_code
         self.type_emb = nn.Embedding(n_types,HIDDEN,padding_idx=0)
         self.proj_txt, self.proj_code = Projection(), Projection()
-    def forward(self, txt_ids, txt_mask, code_ids, code_mask, type_ids):
-        tv = self.proj_txt(
-            self.txt_enc(input_ids=txt_ids, attention_mask=txt_mask)
-               .last_hidden_state[:,0])
-        cv = self.proj_code(
-            self.code_enc(input_ids=code_ids, attention_mask=code_mask)
-               .last_hidden_state[:,0])
-        return tv, cv
+    def forward(self,
+                txt_ids, txt_mask,
+                code_ids, code_mask, type_ids):
+        # -------- text encoder: masked mean pooling -------- #
+        txt_out   = self.txt_enc(input_ids=txt_ids,
+                                 attention_mask=txt_mask).last_hidden_state  # (B,L,H)
+        txt_maskf = txt_mask.unsqueeze(-1)                                   # (B,L,1)
+        txt_vec   = (txt_out * txt_maskf).sum(dim=1) / txt_maskf.sum(dim=1).clamp(min=1e-6)
+        txt_vec   = self.proj_txt(txt_vec)                                   # (B,H) → projection
+
+        # -------- code encoder: masked mean pooling -------- #
+        code_out   = self.code_enc(input_ids=code_ids,
+                                   attention_mask=code_mask).last_hidden_state
+        code_maskf = code_mask.unsqueeze(-1)
+        code_vec   = (code_out * code_maskf).sum(dim=1) / code_maskf.sum(dim=1).clamp(min=1e-6)
+        code_vec   = self.proj_code(code_vec)
+
+        return txt_vec, code_vec
 
 # -----------------------------------------------------------------
 # 5. InfoNCE + metric
@@ -167,7 +178,8 @@ def main():
     sched  = get_linear_schedule_with_warmup(optim,len(dl_tr)//10,
                                              len(dl_tr)*EPOCHS)
     scaler = torch.cuda.amp.GradScaler()
-
+  
+    best_auc = -math.inf
     for ep in range(1, EPOCHS+1):
         trL,trA,trU = run_epoch(model, dl_tr, "train",
                                 optim, scaler, sched, ep)
@@ -178,13 +190,24 @@ def main():
                    "val/loss":vaL,"val/acc":vaA,"val/auc":vaU})
         print(f"[{ep}] train L{trL:.4f}|A{trA:.3f}|U{trU:.3f}  ||  "
               f"val L{vaL:.4f}|A{vaA:.3f}|U{vaU:.3f}")
+        
+        
+        if not math.isnan(vaU) and vaU > best_auc:
+            best_auc = vaU
+            os.makedirs("./models", exist_ok=True)
     
-    # ---------- 모델 저장 ---------- #
-    os.makedirs("./models", exist_ok=True)
-    torch.save(model.module.state_dict(), "./models/contrastive_last.pt")
-    print("Saved to  ./models/contrastive_last.pt")
-
-    print("Done. type-vocab :", n_types); wandb.finish()
+            txt_dir  = f"./models/best_bert_finetuned"
+            code_dir = f"./models/best_codebert_finetuned"
+    
+            model.module.txt_enc.save_pretrained(txt_dir)
+            tok_txt.save_pretrained(txt_dir)
+    
+            model.module.code_enc.save_pretrained(code_dir)
+            tok_code.save_pretrained(code_dir)
+    
+            print(f"★ New best val AUC {vaU:.3f} (epoch {ep}) — saved to {txt_dir} & {code_dir}")
+    
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

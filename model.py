@@ -156,7 +156,7 @@ class CBERT(nn.Module):
       • 시퀀스 앞 2 토큰은 [CLS_sent] [CLS_cross] 용으로 **비워둔 채** 전달
     """
     def __init__(self, num_labels,
-                 num_code_types,
+                 num_tag,
                  text_model_name="bert-base-uncased",
                  code_model_name="microsoft/codebert-base",
                  dropout=0.0):
@@ -167,12 +167,18 @@ class CBERT(nn.Module):
 
         D = self.text.config.hidden_size
         assert D == self.code.config.hidden_size
-        self.type_emb = nn.Embedding(num_code_types, D)
+        #self.type_emb = nn.Embedding(num_code_types, D)
 
+        self.embed_tag = nn.Sequential(
+                            nn.Linear(num_tag,num_tag), 
+                            nn.ReLU(),
+                            nn.Linear(num_tag,16))
+                            
         self.classifier = nn.Sequential(
-            nn.Linear(D * 2 + 4, D),
+            nn.Linear(D * 2 + 3 + 16, D*2),
             nn.ReLU(),
-            nn.Dropout(dropout),
+            nn.Linear(D*2, D),
+            nn.ReLU(),
             nn.Linear(D, num_labels),
         )
 
@@ -184,7 +190,7 @@ class CBERT(nn.Module):
     def forward(self,
                 text_ids, text_mask,
                 code_ids, code_type_ids, code_mask,
-                explicit_feat):
+                feats, tags):
         B, Lt = text_ids.shape
         _, Lc = code_ids.shape
         dev   = text_ids.device
@@ -198,8 +204,7 @@ class CBERT(nn.Module):
         # ── Code Embedding  (+ JOERN token-type)
         c_tok = self.code.embeddings.word_embeddings(code_ids)
         c_pos = self.code.embeddings.position_embeddings(torch.arange(Lc, device=dev))
-        c_type= self.type_emb(code_type_ids)
-        c_hid = c_tok + c_pos + c_type                      # (B,Lc,D)
+        c_hid = c_tok + c_pos                      # (B,Lc,D)
 
         # 두 모달 모두 앞 2 토큰 CLS 초기화
         cls_vec = self.text.embeddings.word_embeddings.weight[0]
@@ -217,8 +222,19 @@ class CBERT(nn.Module):
             # 서로의 CLS_sent(Query) 주입
             t_hid = t_layer(t_hid, t_mask, cross_cls=c_hid[:, 0, :])
             c_hid = c_layer(c_hid, c_mask, cross_cls=t_hid[:, 0, :])
-
-        # final CLS_sent (index 0)
-        t_cls, c_cls = t_hid[:, 0], c_hid[:, 0]
-        logits = self.classifier(torch.cat([t_cls, c_cls, explicit_feat], dim=-1))
+        
+        txt_maskf = t_mask.unsqueeze(-1)                                   # (B,L,1)
+        txt_vec   = (t_hid * txt_maskf).sum(dim=1) / txt_maskf.sum(dim=1).clamp(min=1e-6)
+        
+        code_maskf = c_mask.unsqueeze(-1)                                   # (B,L,1)
+        code_vec   = (c_hid * code_maskf).sum(dim=1) / code_maskf.sum(dim=1).clamp(min=1e-6)
+        
+        tag_embedding = self.embed_tag(tags)
+        
+        logits = self.classifier(torch.cat([txt_vec, code_vec, feats, tag_embedding], dim=-1))
         return logits
+        
+        
+        
+        
+        

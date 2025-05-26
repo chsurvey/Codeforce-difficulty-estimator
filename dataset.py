@@ -179,7 +179,7 @@ class CodeContestsDataset(TorchDataset):
         # (4) Codeforces tags → multi-hot, else 0-vector
         tag_vec = self._encode_tags(ex.get("cf_tags", []))
 
-        return torch.cat((scalar, tag_vec))
+        return (scalar, tag_vec)
 
     # ──────────────────────────────────────────────────────────────────────── #
 
@@ -204,9 +204,9 @@ class CodeContestsDataset(TorchDataset):
         raw_sol, lang_id = sols["solution"][j], sols["language"][j]
 
         # ----  x2 : scalar feature vector  ---- #
-        feat_vec = self._build_feature_vector(ex)
+        feat_vec, tag_vec = self._build_feature_vector(ex)
 
         # ----  y : difficulty label  ---- #
         difficulty = self._compute_difficulty(ex)
 
-        return desc, raw_sol, token2type, feat_vec, difficulty
+        return desc, raw_sol, feat_vec, tag_vec, difficulty # token2type, feat_vec, difficulty

@@ -4,12 +4,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch, torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
-from dataset import CodeContestsDataset                        # ← user file
-from model   import CBERT                                      # ← user file
+from dataset import CodeContestsDataset                        # ??user file
+from model   import CBERT                                      # ??user file
 from config import cfg
 # --------------------------------------------------------------------------- #
 #                   0.  Argument parsing                                      #
@@ -33,12 +33,12 @@ def get_args():
 class Collator:
     """
     Batching function that
-      • prepends **two** CLS tokens and appends one SEP token to *both*
+      ??prepends **two** CLS tokens and appends one SEP token to *both*
         the description prompt and the code solution,
-      • lets the 🤗 FastTokenizer handle padding in a single call,
-      • concatenates the fixed tokens with simple tensor ops
-        (no Python for-loops → faster),
-      • returns (text_ids, text_mask, code_ids, code_type_ids, code_mask,
+      ??lets the ?�� FastTokenizer handle padding in a single call,
+      ??concatenates the fixed tokens with simple tensor ops
+        (no Python for-loops ??faster),
+      ??returns (text_ids, text_mask, code_ids, code_type_ids, code_mask,
                  explicit_feats, labels).
     """
     def __init__(
@@ -64,11 +64,7 @@ class Collator:
     def __call__(
         self, batch: List[Tuple[str, str, torch.Tensor, int]]
     ):
-        batch = [ex for ex in batch if ex[-1] != -1]
-        if not batch:                          # ← 전체가 드롭된 rare 케이스
-            return None                        #   train loop에서 skip
-        
-        descs, codes, type_mappings, feats, labels = zip(*batch)
+        descs, codes, feats, tags, labels = zip(*batch)
         B = len(batch)
 
         # ---------------------- 1.  TEXT (prompt) ------------------------- #
@@ -100,7 +96,7 @@ class Collator:
         )
         prefix_code = torch.full((B, 2), self.cls_id_code, dtype=torch.long)
         sep_code    = torch.full((B, 1), self.sep_id_code,  dtype=torch.long)
-
+  
         code_ids  = torch.cat([prefix_code, enc_c["input_ids"], sep_code], dim=1)
         code_mask = torch.cat(
             [torch.ones_like(prefix_code), enc_c["attention_mask"], torch.ones_like(sep_code)],
@@ -109,26 +105,27 @@ class Collator:
         _, L = code_ids.size()
         device = code_ids.device
 
+        """
         type_tensors = []
         for b in range(B):
-            code = codes[b]                # (L,)  토큰 ID 시퀀스
-            mapping = type_mappings[b]           # dict {token_id: type_id}
+            code = codes[b]                # (L,)  ?�큰 ID ?�퀀??            mapping = type_mappings[b]           # dict {token_id: type_id}
             code = "[CLS]"+code+"[SEP]"
-            # ① 토큰 ID → 타입 ID 매핑 (없으면 0)
+            # ???�큰 ID ???�??ID 매핑 (?�으�?0)
             t = torch.tensor([mapping.get(c_token, 0)  for c_token in self.code_tok.tokenize(code)],
                             dtype=torch.long,
                             device=device)
 
-            # ② 필요하면 특수 토큰(CLS×2, SEP) 수동 지정
-            # CLS_TYPE, SEP_TYPE = 0, 0  # 그대로 두거나 새 번호 부여
-            # t[0:2] = CLS_TYPE
+            # ???�요?�면 ?�수 ?�큰(CLS×2, SEP) ?�동 지??            # CLS_TYPE, SEP_TYPE = 0, 0  # 그�?�??�거????번호 부??            # t[0:2] = CLS_TYPE
             # t[-1]  = SEP_TYPE
 
             type_tensors.append(t)
 
         code_type = torch.stack(type_tensors, dim=0)   # (B, L)
+        """
+        code_type = torch.zeros_like(code_ids)
         # ---------------------- 3.  Explicit features --------------------- #
-        explicit_feats = torch.stack(feats)            # (B, feat_dim)
+        feats = torch.stack(feats)            # (B, feat_dim)
+        tags = torch.stack(tags)            # (B, feat_dim)
 
         return (
             text_ids,
@@ -136,7 +133,8 @@ class Collator:
             code_ids,
             code_type,
             code_mask,
-            explicit_feats,
+            feats,
+            tags,
             torch.tensor(labels),
         )
 
@@ -153,9 +151,12 @@ def main():
     args = get_args(); set_seed(args.seed)
     dev = torch.device(args.device)
 
-    # ① Dataset & dataloader
-    train_ds = CodeContestsDataset(subset=args.subset, split="train", seed=args.seed)
-    val_ds   = CodeContestsDataset(subset=args.subset, split="valid", seed=args.seed)
+    VAL_RATIO = 0.1
+    full_ds = CodeContestsDataset(subset=args.subset, split="train", seed=args.seed)
+    val_len = int(len(full_ds)*VAL_RATIO)
+    train_len = len(full_ds) - val_len
+    train_ds, val_ds = random_split(full_ds, [train_len, val_len],
+                                generator=torch.Generator().manual_seed(42))
 
     txt_tok  = AutoTokenizer.from_pretrained("bert-base-uncased")
     code_tok = AutoTokenizer.from_pretrained("microsoft/codebert-base")
@@ -169,15 +170,15 @@ def main():
     val_ld   = DataLoader(val_ds,   batch_size=args.bsz, shuffle=False,
                           collate_fn=collate, num_workers=num_workers, pin_memory=True)
 
-    # ② Model (num_labels = max difficulty id + 1)
     num_labels = max(ex[-1] for ex in train_ds) + 1
-    model = CBERT(num_labels, cfg.num_code_types)
-    # classifier 첫 층 입력크기 수정 (D*2 + feat_dim)
+    num_tag = len(train_ds[0][-2])
+    model = CBERT(num_labels, num_tag, cfg.num_code_types)
+    
     D = model.text.config.hidden_size
     model.classifier[0] = nn.Linear(D*2 + feat_dim, D)
     model = model.to(dev)
 
-    # ③ Optim / sched / loss
+    # Optim / sched / loss
     opt  = torch.optim.AdamW(model.parameters(), lr=args.lr)
     total_steps = len(train_ld) * args.epochs
     sched = get_cosine_schedule_with_warmup(opt,
@@ -185,14 +186,14 @@ def main():
                 num_training_steps=total_steps)
     crit = nn.CrossEntropyLoss()
 
-    # ④ Train loop
+    # Train loop
     for ep in range(1, args.epochs+1):
         model.train()
         tot_loss, tot = 0.0, 0
         for batch in train_ld:
-            (tid, tmask, cid, ctype, cmask, feat, y) = [x.to(dev) for x in batch]
+            (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
             opt.zero_grad()
-            logits = model(tid, tmask, cid, ctype, cmask, feat)
+            logits = model(tid, tmask, cid, cmask, feat, tag)
             loss = crit(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -205,8 +206,8 @@ def main():
         correct, total = 0, 0
         with torch.no_grad():
             for batch in val_ld:
-                (tid, tmask, cid, ctype, cmask, feat, y) = [x.to(dev) for x in batch]
-                logits = model(tid, tmask, cid, ctype, cmask, feat)
+                (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
+                logits = model(tid, tmask, cid, cmask, feat, tag)
                 pred = logits.argmax(-1)
                 correct += (pred==y).sum().item()
                 total   += y.size(0)
@@ -216,7 +217,7 @@ def main():
         # ---- checkpoint --------------------------------------------------- #
         ckpt = f"ckpt_epoch{ep}.pt"
         torch.save(model.state_dict(), ckpt)
-        print(f"saved → {ckpt}")
+        print(f"saved ??{ckpt}")
 
 if __name__ == "__main__":
     main()
