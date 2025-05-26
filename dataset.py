@@ -126,13 +126,10 @@ class CodeContestsDataset(TorchDataset):
 
         # ⚠  store as Python list for fast random access by index
         self.data: List[Dict] = ds.with_format("python")[:]
-        self.data["code_token"] = []
-        self.data["code_type"] = []
+        self.data["token2type"] = []
         for idx, name in enumerate(self.data["name"]):
-            c_token = tokenized_solution[name]["token"]
-            c_type = tokenized_solution[name]["type"]
-            self.data["code_token"].append(c_token)
-            self.data["code_type"].append(c_type)
+            token2type = tokenized_solution[name]["token2type"]
+            self.data["token2type"].append(token2type)
             
         # ── ① 모든 Codeforces 문제에서 tag vocabulary 수집
         tag_set = set()

@@ -156,9 +156,9 @@ class CBERT(nn.Module):
       • 시퀀스 앞 2 토큰은 [CLS_sent] [CLS_cross] 용으로 **비워둔 채** 전달
     """
     def __init__(self, num_labels,
+                 num_code_types,
                  text_model_name="bert-base-uncased",
                  code_model_name="microsoft/codebert-base",
-                 num_code_types=20,
                  dropout=0.0):
         super().__init__()
         # backbones → cross-layer 변환

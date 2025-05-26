@@ -1,92 +1,153 @@
-import ijson
-import torch
-from transformers import AutoTokenizer, AutoModel
-import torch.nn as nn
-from tqdm import tqdm
+# train_codecontest_contrastive.py
+import random, torch, torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from transformers import (AutoTokenizer, AutoModel,
+                          get_linear_schedule_with_warmup)
+from tqdm.auto import tqdm
+from dataset import CodeContestsDataset
 
-# Tokenizer 및 Pretrained Model 초기화
-# BERT는 문제 설명용, CodeBERT는 코드용
-tokenizer_bert = AutoTokenizer.from_pretrained("bert-base-uncased")
-model_bert = AutoModel.from_pretrained("bert-base-uncased")
-tokenizer_codebert = AutoTokenizer.from_pretrained("microsoft/codebert-base")
-model_codebert = AutoModel.from_pretrained("microsoft/codebert-base")
-model_bert.eval()
-model_codebert.eval()
+# -------------------- Hyper-parameters -------------------- #
+BATCH          = 16
+EPOCHS         = 3
+TXT_MAXLEN     = 128
+CODE_MAXLEN    = 256
+HIDDEN         = 768
+PROJ_DIM       = 256
+LR_ENCODER     = 2e-5
+LR_OTHER       = 1e-4
+GRAD_ACCUM     = 2
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 임베딩 후 projection layer 정의 (논문)
-# 모델 임베딩 → 평균 풀링 → proj layer (768 → 256)
-proj_dim = 256
-proj_bert = nn.Linear(768, proj_dim)
-proj_codebert = nn.Linear(768, proj_dim)
+# -------------------- Tokenizer & Encoder ------------------ #
+tok_txt  = AutoTokenizer.from_pretrained("bert-base-uncased")
+enc_txt  = AutoModel.from_pretrained("bert-base-uncased")
 
-# 타입 문자열을 고유한 숫자 ID로 매핑
-type2id = {}
-type_id_counter = 0
+tok_code = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+enc_code = AutoModel.from_pretrained("microsoft/codebert-base")
 
-def map_types_to_ids(token2type: dict) -> list:
-    """
-    {"K": "int", "ad": "long"} → ["0", "1"]
-    타입마다 고유 ID 부여 후 숫자 시퀀스로 반환
-    """
-    global type2id, type_id_counter
-    id_list = []
-    for token, typename in token2type.items():
-        typename = typename.strip()
-        if typename not in type2id:
-            type2id[typename] = type_id_counter
-            type_id_counter += 1
-        id_list.append(str(type2id[typename]))
-    return id_list
+# -------------------- Dataset Wrapper --------------------- #
+class PosPairDataset(Dataset):
+    """desc, raw_sol, token2type 만 쓰는 래퍼."""
+    def __init__(self, split="train", seed=42):
+        self.inner = CodeContestsDataset(split=split, subset="codeforces", seed=seed)
+        # 미리 type 개수 파악 (max id + 1) – 0은 unknown
+        all_ids = [tid for m in self.inner.data["token2type"] for tid in m.values()]
+        self.n_types = max(all_ids, default=0) + 1
+    def __len__(self):                 return len(self.inner)
+    def __getitem__(self, idx):
+        desc, sol, token2type, *_ = self.inner[idx]
+        return desc, sol, token2type
 
-# CosineEmbeddingLoss 사용
-loss_fn = nn.CosineEmbeddingLoss()
+# -------------------- Collate fn -------------------------- #
+def collate(batch):
+    descs, codes, maps = zip(*batch)
 
-# 메인 학습 함수
-def run_contrastive(json_path: str):
-    losses = []
+    # ── Text ───────────────────── #
+    txt = tok_txt(list(descs), return_tensors="pt",
+                  padding=True, truncation=True, max_length=TXT_MAXLEN)
 
-    # json 파일을 streaming 방식으로 읽음
-    with open(json_path, "r") as f:
-        for problem_name, entry in tqdm(ijson.kvitems(f, ""), desc="Processing problems"):
-            solutions = entry.get("solutions", [])
-            incorrects = entry.get("incorrect_solutions", [])
-            text = problem_name  # 문제명 → BERT 입력
+    # ── Code : ids + type_ids ──── #
+    code_tok = tok_code(list(codes), return_tensors="pt",
+                        padding=True, truncation=True, max_length=CODE_MAXLEN)
 
-            for sol in solutions:
-                for inc in incorrects:
-                    #  정답/오답 token2type → 타입 ID 시퀀스로 변환
-                    tokens_pos = map_types_to_ids(sol.get("token2type", {}))
-                    tokens_neg = map_types_to_ids(inc.get("token2type", {}))
-                    if not tokens_pos or not tokens_neg:
-                        continue
+    type_tensors = []
+    L = code_tok["input_ids"].shape[1]
+    for code_str, mapping in zip(codes, maps):
+        toks = tok_code.tokenize(code_str)
+        # CLS 두 개 & SEP 한 개(코드베이스와 동일) → 0 타입 사용
+        type_ids = [0, 0] + [mapping.get(t, 0) for t in toks][:CODE_MAXLEN-3] + [0]
+        # pad / truncate
+        type_ids = type_ids + [0]*(L - len(type_ids)) if len(type_ids) < L else type_ids[:L]
+        type_tensors.append(torch.tensor(type_ids, dtype=torch.long))
+    code_type = torch.stack(type_tensors)
 
-                    # 타입 ID 시퀀스를 문자열로 변환
-                    code_pos = " ".join(tokens_pos)
-                    code_neg = " ".join(tokens_neg)
+    return (txt["input_ids"], txt["attention_mask"],
+            code_tok["input_ids"], code_tok["attention_mask"],
+            code_type)
 
-                    # 입력 텐서 생성
-                    input_text = tokenizer_bert(text, return_tensors="pt", truncation=True, padding=True)
-                    input_pos = tokenizer_codebert(code_pos, return_tensors="pt", truncation=True, padding=True)
-                    input_neg = tokenizer_codebert(code_neg, return_tensors="pt", truncation=True, padding=True)
+# -------------------- Model ------------------------------- #
+class Projection(nn.Module):
+    def __init__(self, in_dim=HIDDEN, out_dim=PROJ_DIM):
+        super().__init__()
+        self.proj = nn.Sequential(nn.Linear(in_dim, out_dim), nn.Tanh())
+    def forward(self, x):                      # x: (B, L, H)
+        return self.proj(x.mean(dim=1))        # mean-pool
 
-                    with torch.no_grad():
-                        # BERT → 평균 풀링 → projection
-                        emb_text = model_bert(**input_text).last_hidden_state.mean(dim=1)
-                        emb_text = proj_bert(emb_text)
+class ContrastiveModel(nn.Module):
+    def __init__(self, n_types: int):
+        super().__init__()
+        self.txt_enc   = enc_txt
+        self.code_enc  = enc_code
+        self.type_emb  = nn.Embedding(n_types, HIDDEN)
+        self.proj_txt  = Projection()
+        self.proj_code = Projection()
+    def forward(self, txt_ids, txt_mask,
+                      code_ids, code_mask, type_ids):
+        # --- Text branch ---
+        txt_h = self.txt_enc(input_ids=txt_ids,
+                             attention_mask=txt_mask).last_hidden_state
+        txt_vec = self.proj_txt(txt_h)
 
-                        # CodeBERT → 평균 풀링 → projection
-                        emb_pos = model_codebert(**input_pos).last_hidden_state.mean(dim=1)
-                        emb_pos = proj_codebert(emb_pos)
-                        emb_neg = model_codebert(**input_neg).last_hidden_state.mean(dim=1)
-                        emb_neg = proj_codebert(emb_neg)
+        # --- Code branch w/ type embedding add ---
+        code_h = self.code_enc(input_ids=code_ids,
+                               attention_mask=code_mask).last_hidden_state
+        code_h = code_h + self.type_emb(type_ids.to(code_h.device))
+        code_vec = self.proj_code(code_h)
+        return txt_vec, code_vec
 
-                    # Positive / Negative 쌍에 대해 loss 계산
-                    loss_pos = loss_fn(emb_text, emb_pos, torch.tensor([1.0]))
-                    loss_neg = loss_fn(emb_text, emb_neg, torch.tensor([-1.0]))
+# -------------------- Training ---------------------------- #
+def train():
+    ds  = PosPairDataset(split="train", seed=0)
+    dl  = DataLoader(ds, batch_size=BATCH, shuffle=True,
+                     num_workers=2, collate_fn=collate, pin_memory=True)
 
-                    # 평균 loss 기록
-                    losses.append(((loss_pos + loss_neg) / 2).item())
+    model = ContrastiveModel(n_types=ds.n_types).to(device)
+    loss_fn = nn.CosineEmbeddingLoss()
+    optim = torch.optim.AdamW([
+        {"params": model.txt_enc.parameters(), "lr": LR_ENCODER},
+        {"params": model.code_enc.parameters(), "lr": LR_ENCODER},
+        {"params": list(model.type_emb.parameters()) +
+                   list(model.proj_txt.parameters()) +
+                   list(model.proj_code.parameters()), "lr": LR_OTHER}
+    ], weight_decay=1e-2)
+    scheduler = get_linear_schedule_with_warmup(
+        optim, len(dl)//10, len(dl)*EPOCHS)
 
-    # 결과 출력
-    print(f" 평균 Contrastive 손실: {sum(losses)/len(losses):.4f}")
-    print(f" 총 타입 수: {len(type2id)}개")
+    scaler = torch.cuda.amp.GradScaler()
+
+    for epoch in range(1, EPOCHS+1):
+        model.train(); running = 0.0
+        for step, batch in enumerate(tqdm(dl, desc=f"Epoch {epoch}")):
+            (txt_ids, txt_mask,
+             code_ids, code_mask,
+             type_ids) = [x.to(device) for x in batch]
+
+            # ── in-batch negative (random permute) ── #
+            perm = torch.randperm(txt_ids.size(0), device=device)
+            txt_neg = code_ids[perm]; mask_neg = code_mask[perm]; type_neg = type_ids[perm]
+
+            with torch.cuda.amp.autocast():
+                v_txt, v_pos = model(txt_ids, txt_mask,
+                                     code_ids, code_mask, type_ids)
+                _,     v_neg = model(txt_ids, txt_mask,
+                                     txt_neg, mask_neg, type_neg)
+
+                emb1   = torch.cat([v_txt, v_txt], dim=0)
+                emb2   = torch.cat([v_pos, v_neg], dim=0)
+                target = torch.cat([torch.ones(v_txt.size(0),  device=device),
+                                    -torch.ones(v_txt.size(0), device=device)])
+                loss = loss_fn(emb1, emb2, target)
+
+            scaler.scale(loss/GRAD_ACCUM).backward()
+            running += loss.item()
+
+            if (step+1) % GRAD_ACCUM == 0:
+                scaler.step(optim); scaler.update()
+                optim.zero_grad(); scheduler.step()
+
+        print(f"[Epoch {epoch}]  mean loss = {running/len(dl):.4f}")
+
+    print("Training done.  total type-vocab :", ds.n_types)
+
+if __name__ == "__main__":
+    train()
