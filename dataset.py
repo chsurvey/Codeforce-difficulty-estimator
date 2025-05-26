@@ -115,10 +115,11 @@ class CodeContestsDataset(TorchDataset):
         if subset not in {"all", "codeforces", "codechef"}:
             raise ValueError("subset must be one of all / codeforces / codechef")
         self.rng = random.Random(seed)
-
+        
         # load once → filter once → keep in memory as standard dict list
         ds: Dataset = load_dataset(self._HF_NAME, split=split)
-        tokenized_solution = json.load("~/playground/data/"+subset+"/solutions.json")
+        with open("/home/guest-cjh/playground/data/"+subset+"/solutions.json", "r") as f:
+          tokenized_solution = json.load(f)
         
         if subset != "all":
             keep_id = 2 if subset == "codeforces" else 1  # cf=2, cc=1
@@ -127,9 +128,16 @@ class CodeContestsDataset(TorchDataset):
         # ⚠  store as Python list for fast random access by index
         self.data: List[Dict] = ds.with_format("python")[:]
         self.data["token2type"] = []
+        invalid_idx = []
         for idx, name in enumerate(self.data["name"]):
-            token2type = tokenized_solution[name]["token2type"]
+            token2type = tokenized_solution.get(name, {"token2type":None})["token2type"]
+            if token2type == None:
+              invalid_idx.append(idx)
             self.data["token2type"].append(token2type)
+        
+        invalid_idx = set(invalid_idx)
+        for key in self.data.keys():
+          self.data[key] = [val for idx, val in enumerate(self.data[key]) if idx not in invalid_idx]
             
         # ── ① 모든 Codeforces 문제에서 tag vocabulary 수집
         tag_set = set()

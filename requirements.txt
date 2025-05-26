@@ -101,7 +101,6 @@ stack_data @ file:///home/conda/feedstock_root/build_artifacts/stack_data_173356
 sympy==1.14.0
 threadpoolctl==3.6.0
 tokenizers==0.21.1
-torch==2.7.0
 tornado @ file:///home/conda/feedstock_root/build_artifacts/tornado_1732615898999/work
 tqdm==4.67.1
 traitlets @ file:///home/conda/feedstock_root/build_artifacts/traitlets_1733367359838/work
