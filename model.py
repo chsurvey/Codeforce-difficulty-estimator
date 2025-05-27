@@ -218,10 +218,15 @@ class CBERT(nn.Module):
         # ───────────────────────────────────────────────
         #  Layer-by-Layer  (Q-swap per layer)
         # ───────────────────────────────────────────────
+        
+        # added moe loss for use in model.py 
+        # total_moe_loss is a scalar tensor (0 if use_moe=False)
+        total_moe_loss = 0.
         for t_layer, c_layer in zip(self.text.encoder.layer, self.code.encoder.layer):
             # 서로의 CLS_sent(Query) 주입
-            t_hid = t_layer(t_hid, t_mask, cross_cls=c_hid[:, 0, :])
-            c_hid = c_layer(c_hid, c_mask, cross_cls=t_hid[:, 0, :])
+            t_hid, t_loss = t_layer(t_hid, t_mask, cross_cls=c_hid[:, 0, :])
+            c_hid, c_loss = c_layer(c_hid, c_mask, cross_cls=t_hid[:, 0, :])
+            total_moe_loss = total_moe_loss + t_loss + c_loss
         
         txt_maskf = t_mask.unsqueeze(-1)                                   # (B,L,1)
         txt_vec   = (t_hid * txt_maskf).sum(dim=1) / txt_maskf.sum(dim=1).clamp(min=1e-6)
@@ -232,7 +237,7 @@ class CBERT(nn.Module):
         tag_embedding = self.embed_tag(tags)
         
         logits = self.classifier(torch.cat([txt_vec, code_vec, feats, tag_embedding], dim=-1))
-        return logits
+        return logits, total_moe_loss
         
         
         

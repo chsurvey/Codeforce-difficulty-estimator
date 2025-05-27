@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader, random_split
 
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
-from dataset import CodeContestsDataset                        # ??user file
-from model   import CBERT                                      # ??user file
+from dataset import CodeContestsDataset                        # user file
+from model   import CBERT                                      # user file
 from config import cfg
 # --------------------------------------------------------------------------- #
 #                   0.  Argument parsing                                      #
@@ -33,12 +33,12 @@ def get_args():
 class Collator:
     """
     Batching function that
-      ??prepends **two** CLS tokens and appends one SEP token to *both*
+      - prepends **two** CLS tokens and appends one SEP token to *both*
         the description prompt and the code solution,
-      ??lets the ?§ó FastTokenizer handle padding in a single call,
-      ??concatenates the fixed tokens with simple tensor ops
-        (no Python for-loops ??faster),
-      ??returns (text_ids, text_mask, code_ids, code_type_ids, code_mask,
+      - lets the FastTokenizer handle padding in a single call,
+      - concatenates the fixed tokens with simple tensor ops
+        (no Python for-loops -> faster),
+      - returns (text_ids, text_mask, code_ids, code_type_ids, code_mask,
                  explicit_feats, labels).
     """
     def __init__(
@@ -105,23 +105,6 @@ class Collator:
         _, L = code_ids.size()
         device = code_ids.device
 
-        """
-        type_tensors = []
-        for b in range(B):
-            code = codes[b]                # (L,)  ?†ÌÅ∞ ID ?úÌÄÄ??            mapping = type_mappings[b]           # dict {token_id: type_id}
-            code = "[CLS]"+code+"[SEP]"
-            # ???†ÌÅ∞ ID ???Ä??ID Îß§Ìïë (?ÜÏúºÎ©?0)
-            t = torch.tensor([mapping.get(c_token, 0)  for c_token in self.code_tok.tokenize(code)],
-                            dtype=torch.long,
-                            device=device)
-
-            # ???ÑÏöî?òÎ©¥ ?πÏàò ?†ÌÅ∞(CLS√ó2, SEP) ?òÎèô ÏßÄ??            # CLS_TYPE, SEP_TYPE = 0, 0  # Í∑∏Î?Î°??êÍ±∞????Î≤àÌò∏ Î∂Ä??            # t[0:2] = CLS_TYPE
-            # t[-1]  = SEP_TYPE
-
-            type_tensors.append(t)
-
-        code_type = torch.stack(type_tensors, dim=0)   # (B, L)
-        """
         code_type = torch.zeros_like(code_ids)
         # ---------------------- 3.  Explicit features --------------------- #
         feats = torch.stack(feats)            # (B, feat_dim)
@@ -193,8 +176,9 @@ def main():
         for batch in train_ld:
             (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
             opt.zero_grad()
-            logits = model(tid, tmask, cid, cmask, feat, tag)
-            loss = crit(logits, y)
+            logits, moe_loss = model(tid, tmask, cid, cmask, feat, tag)
+            ce_loss = crit(logits, y)
+            loss = ce_loss + cfg.moe_loss_weight * moe_loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step()
@@ -207,7 +191,7 @@ def main():
         with torch.no_grad():
             for batch in val_ld:
                 (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
-                logits = model(tid, tmask, cid, cmask, feat, tag)
+                logits, _ = model(tid, tmask, cid, cmask, feat, tag)
                 pred = logits.argmax(-1)
                 correct += (pred==y).sum().item()
                 total   += y.size(0)
