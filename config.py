@@ -12,8 +12,8 @@ class CFG:
     # optimization
     lr = 2e-5
     weight_decay = 1e-2
-    batch_size = 8
-    epochs = 10
+    batch_size = 64
+    epochs = 30
     warmup_ratio = 0.1
 
     # runtime
@@ -22,7 +22,7 @@ class CFG:
     log_dir = "runs"
     
     # MoE toggles
-    use_moe           = True      # master on/off switch
+    use_moe           = False      # master on/off switch
     moe_num_experts   = 8         # 4 / 8 / 16 …
     moe_top_k         = 2         # 1 = Switch-Transformer, 2 = standard MoE
     moe_loss_weight   = 0.01      # λ for load-balancing aux loss

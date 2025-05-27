@@ -12,6 +12,19 @@ import torch, math
 import torch.nn as nn
 from transformers import AutoModel
 
+# ── mean-pool utility ───────────────────────────────────────────────
+def masked_mean_pool(hidden, mask):
+    """
+    hidden : (B, L, D)
+    mask   : (B, L)   ─ 1 for real token, 0 for pad
+    returns: (B, D)
+    """
+    mask = mask.float().unsqueeze(-1)          # (B, L, 1)
+    summed = (hidden * mask).sum(dim=1)        # (B, D)
+    denom  = mask.sum(dim=1).clamp(min=1e-6)   # avoid div-by-0
+    return summed / denom
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # 1.  Self-Attention that **replaces Query of CLS_cross (index 1)** only
 # ────────────────────────────────────────────────────────────────────────────
@@ -131,7 +144,7 @@ class CrossLayer(nn.Module):
             ffn_out = self.act_fn(self.inter(x))
             x = self.out_ln(x + self.dropout(self.out(ffn_out)))
             moe_loss = x.new_zeros(())                  # MoE loss is unused: fill with scalar 0
-        return x, moe_loss
+        return x#, moe_loss if self.use_moe else x
 
 def convert_to_cross_encoder(model):
     """Replace every BertLayer with CrossLayer in-place."""
@@ -159,11 +172,14 @@ class CBERT(nn.Module):
                  num_tag,
                  text_model_name="bert-base-uncased",
                  code_model_name="microsoft/codebert-base",
-                 dropout=0.0):
+                 dropout=0.0,
+                 convert=True):
         super().__init__()
-        # backbones → cross-layer 변환
-        self.text = convert_to_cross_encoder(AutoModel.from_pretrained(text_model_name))
-        self.code = convert_to_cross_encoder(AutoModel.from_pretrained(code_model_name))
+        self.convert = convert
+        if convert:
+            # backbones → cross-layer 변환
+            self.text = convert_to_cross_encoder(AutoModel.from_pretrained(text_model_name))
+            self.code = convert_to_cross_encoder(AutoModel.from_pretrained(code_model_name))
 
         D = self.text.config.hidden_size
         assert D == self.code.config.hidden_size
@@ -181,7 +197,7 @@ class CBERT(nn.Module):
             nn.ReLU(),
             nn.Linear(D, num_labels),
         )
-
+    
     # helper: get extended mask (B,1,1,L)
     @staticmethod
     def _ext_mask(mask, model):
@@ -189,51 +205,49 @@ class CBERT(nn.Module):
 
     def forward(self,
                 text_ids, text_mask,
-                code_ids, code_type_ids, code_mask,
+                code_ids, code_mask,
                 feats, tags):
         B, Lt = text_ids.shape
         _, Lc = code_ids.shape
         dev   = text_ids.device
         D     = self.text.config.hidden_size
-
+    
         # ── Text Embedding
         t_tok = self.text.embeddings.word_embeddings(text_ids)
         t_pos = self.text.embeddings.position_embeddings(torch.arange(Lt, device=dev))
         t_hid = t_tok + t_pos                               # (B,Lt,D)
-
+    
         # ── Code Embedding  (+ JOERN token-type)
         c_tok = self.code.embeddings.word_embeddings(code_ids)
         c_pos = self.code.embeddings.position_embeddings(torch.arange(Lc, device=dev))
         c_hid = c_tok + c_pos                      # (B,Lc,D)
-
+    
         # 두 모달 모두 앞 2 토큰 CLS 초기화
         cls_vec = self.text.embeddings.word_embeddings.weight[0]
         t_hid[:, :2, :] = cls_vec
         c_hid[:, :2, :] = cls_vec
-
+    
         # mask
         t_mask = self._ext_mask(text_mask, self.text)
         c_mask = self._ext_mask(code_mask,  self.code)
-
+    
         # ───────────────────────────────────────────────
         #  Layer-by-Layer  (Q-swap per layer)
         # ───────────────────────────────────────────────
         for t_layer, c_layer in zip(self.text.encoder.layer, self.code.encoder.layer):
             # 서로의 CLS_sent(Query) 주입
-            t_hid = t_layer(t_hid, t_mask, cross_cls=c_hid[:, 0, :])
-            c_hid = c_layer(c_hid, c_mask, cross_cls=t_hid[:, 0, :])
+            t_hid_buf = t_hid*1
+            c_hid_buf = c_hid*1
+            t_hid = t_layer(t_hid_buf, t_mask, cross_cls=c_hid_buf[:, 0, :])
+            c_hid = c_layer(c_hid_buf, c_mask, cross_cls=t_hid_buf[:, 0, :])
         
-        txt_maskf = t_mask.unsqueeze(-1)                                   # (B,L,1)
-        txt_vec   = (t_hid * txt_maskf).sum(dim=1) / txt_maskf.sum(dim=1).clamp(min=1e-6)
-        
-        code_maskf = c_mask.unsqueeze(-1)                                   # (B,L,1)
-        code_vec   = (c_hid * code_maskf).sum(dim=1) / code_maskf.sum(dim=1).clamp(min=1e-6)
+        txt_vec  = masked_mean_pool(t_hid, text_mask)   # (B, D)
+        code_vec = masked_mean_pool(c_hid, code_mask)   # (B, D)
         
         tag_embedding = self.embed_tag(tags)
-        
-        logits = self.classifier(torch.cat([txt_vec, code_vec, feats, tag_embedding], dim=-1))
+        # print(txt_vec.shape, code_vec.shape, feats.shape, tag_embedding.shape)
+        logits = self.classifier(torch.cat([txt_vec, code_vec, feats, tag_embedding], dim=1))
         return logits
-        
         
         
         
