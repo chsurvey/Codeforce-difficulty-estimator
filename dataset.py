@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 import pandas as pd
 import json
+import numpy as np
 
 __all__ = ["CodeContestsDataset"]
 
@@ -135,6 +136,11 @@ class CodeContestsDataset(TorchDataset):
               invalid_idx.append(idx)
             self.data["token2type"].append(token2type)
         
+        
+        ratings = self.data["cf_rating"]
+        self.mu   = float(np.mean(ratings))
+        self.sigma = float(np.std(ratings) + 1e-8)            # div-by-zero 안전장치
+        
         invalid_idx = set(invalid_idx)
         for key in self.data.keys():
           self.data[key] = [val for idx, val in enumerate(self.data[key]) if idx not in invalid_idx]
@@ -147,6 +153,14 @@ class CodeContestsDataset(TorchDataset):
         self.tag2idx: Dict[str, int] = {t: i for i, t in enumerate(sorted(tag_set))}
         self.n_tags = len(self.tag2idx)
 
+    def _compute_difficulty(self, r: int) -> int:
+        """Codeforces rating r → {0,1,2} 레이블"""
+        if r < self.mu - self.sigma:
+            return 0
+        elif r < self.mu + self.sigma:
+            return 1
+        return 2
+        
     # ──────────────────────────────────────────────────────────────────────── #
 
     def __len__(self) -> int:
@@ -183,12 +197,6 @@ class CodeContestsDataset(TorchDataset):
 
     # ──────────────────────────────────────────────────────────────────────── #
 
-    def _compute_difficulty(self, ex: Dict) -> int:
-        """Return difficulty label as int according to user spec."""
-        return ex["difficulty"]
-
-    # ──────────────────────────────────────────────────────────────────────── #
-
     def __getitem__(self, idx: int) -> Tuple[str, str, torch.Tensor, int]:
         ex = {key:self.data[key][idx] for key in self.data.keys()}
 
@@ -207,6 +215,7 @@ class CodeContestsDataset(TorchDataset):
         feat_vec, tag_vec = self._build_feature_vector(ex)
 
         # ----  y : difficulty label  ---- #
-        difficulty = self._compute_difficulty(ex)
+        y = self._compute_difficulty(ex["cf_rating"])
 
-        return desc, raw_sol, feat_vec, tag_vec, difficulty # token2type, feat_vec, difficulty
+        return desc, raw_sol, feat_vec, tag_vec, y
+        

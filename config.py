@@ -13,7 +13,7 @@ class CFG:
     lr = 2e-5
     weight_decay = 1e-2
     batch_size = 8
-    epochs = 10
+    epochs = 30
     warmup_ratio = 0.1
 
     # runtime
