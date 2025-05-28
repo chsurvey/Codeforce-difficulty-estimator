@@ -72,6 +72,7 @@ class CustomSelfAttention(nn.Module):
 # 2.  Transformer layer wrapper:  Self-Attention(Q-swap) + FFN
 # ────────────────────────────────────────────────────────────────────────────
 from deepspeed.moe.layer import MoE
+from deepspeed.moe.experts import Experts
 class FeedForwardExpert(nn.Module):
     # exactly the same hidden sizes as the old FFN
     def __init__(self, hidden_size, intermediate_size, activation):
@@ -110,11 +111,11 @@ class CrossLayer(nn.Module):
                 k = global_cfg.moe_top_k,
             )        
             # warm-start every expert from the dense FFN
-            for exp in self.moe.experts:
+            for exp in self.moe.deepspeed_moe.experts.deepspeed_experts:
                 exp.fc1.weight.data.copy_(bert_layer.intermediate.dense.weight)
                 exp.fc1.bias.data.copy_(bert_layer.intermediate.dense.bias)
                 exp.fc2.weight.data.copy_(bert_layer.output.dense.weight)
-                exp.fc2.bias.data.copy_(bert_layer.output.dense.bias)\
+                exp.fc2.bias.data.copy_(bert_layer.output.dense.bias)
                     
         else:
             # just use regular FFN
