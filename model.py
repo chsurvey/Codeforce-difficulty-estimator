@@ -11,6 +11,7 @@ Full “C-BERT” reference implementation
 import torch, math
 import torch.nn as nn
 from transformers import AutoModel
+from config import cfg as global_cfg
 
 # ── mean-pool utility ───────────────────────────────────────────────
 def masked_mean_pool(hidden, mask):
@@ -74,7 +75,7 @@ from deepspeed.moe.layer import MoE
 class FeedForwardExpert(nn.Module):
     # exactly the same hidden sizes as the old FFN
     def __init__(self, hidden_size, intermediate_size, activation):
-        super().__init__(hidden_size, intermediate_size, activation)
+        super().__init__()
         self.fc1 = nn.Linear(hidden_size, intermediate_size)
         self.act = activation
         self.fc2 = nn.Linear(intermediate_size, hidden_size)
@@ -93,7 +94,8 @@ class CrossLayer(nn.Module):
         self.dropout   = nn.Dropout(cfg.hidden_dropout_prob)
         
         # FFN or MoE? (cfg.use_moe)
-        self.use_moe = getattr(cfg, "use_moe", False)
+        global global_cfg
+        self.use_moe = global_cfg.use_moe
         
         if self.use_moe:
             # build the MoE, replace the dense FFN
@@ -104,8 +106,8 @@ class CrossLayer(nn.Module):
                     cfg.intermediate_size, 
                     activation = nn.functional.gelu
                 ),
-                num_experts= num_experts,
-                k = top_k,
+                num_experts= global_cfg.moe_num_experts,
+                k = global_cfg.moe_top_k,
             )        
             # warm-start every expert from the dense FFN
             for exp in self.moe.experts:
@@ -143,8 +145,8 @@ class CrossLayer(nn.Module):
         else:
             ffn_out = self.act_fn(self.inter(x))
             x = self.out_ln(x + self.dropout(self.out(ffn_out)))
-            moe_loss = x.new_zeros(())                  # MoE loss is unused: fill with scalar 0
-        return x#, moe_loss if self.use_moe else x
+            moe_loss = 0                  # MoE loss is unused: fill with scalar 0
+        return x, moe_loss
 
 def convert_to_cross_encoder(model):
     """Replace every BertLayer with CrossLayer in-place."""
@@ -234,12 +236,16 @@ class CBERT(nn.Module):
         # ───────────────────────────────────────────────
         #  Layer-by-Layer  (Q-swap per layer)
         # ───────────────────────────────────────────────
+        total_moe_loss = 0.
         for t_layer, c_layer in zip(self.text.encoder.layer, self.code.encoder.layer):
             # 서로의 CLS_sent(Query) 주입
-            t_hid_buf = t_hid*1
-            c_hid_buf = c_hid*1
-            t_hid = t_layer(t_hid_buf, t_mask, cross_cls=c_hid_buf[:, 0, :])
-            c_hid = c_layer(c_hid_buf, c_mask, cross_cls=t_hid_buf[:, 0, :])
+            #t_hid = t_layer(t_hid, t_mask, cross_cls=None)#torch.zeros_like(c_hid[:, 0, :]).to(dev))
+            #c_hid = c_layer(c_hid, c_mask, cross_cls=None)#torch.zeros_like(c_hid[:, 0, :]).to(dev))
+            t_hid_buf = t_hid.clone()
+            c_hid_buf = c_hid.clone()
+            t_hid, t_loss = t_layer(t_hid, t_mask, cross_cls=c_hid_buf[:, 0, :])
+            c_hid, c_loss = c_layer(c_hid, c_mask, cross_cls=t_hid_buf[:, 0, :])
+            total_moe_loss = total_moe_loss + t_loss + c_loss
         
         txt_vec  = masked_mean_pool(t_hid, text_mask)   # (B, D)
         code_vec = masked_mean_pool(c_hid, code_mask)   # (B, D)
@@ -247,8 +253,7 @@ class CBERT(nn.Module):
         tag_embedding = self.embed_tag(tags)
         # print(txt_vec.shape, code_vec.shape, feats.shape, tag_embedding.shape)
         logits = self.classifier(torch.cat([txt_vec, code_vec, feats, tag_embedding], dim=1))
-        return logits
-        
+        return logits, total_moe_loss
         
         
         

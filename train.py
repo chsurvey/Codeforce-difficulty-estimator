@@ -178,7 +178,7 @@ def main():
         pin_memory=True,
     )
 
-    model = nn.DataParallel(CBERT(num_labels, num_tag).to(dev))
+    model = nn.DataParallel(CBERT(num_labels, num_tag).to(dev))#, '/home/guest-cjh/playground/models/best_bert_finetuned/', '/home/guest-cjh/playground/models/best_codebert_finetuned/').to(dev))
 
     # Optim / sched / loss
     opt  = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -202,8 +202,9 @@ def main():
         for batch in train_pbar:
             (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
             opt.zero_grad()
-            logits = model(tid, tmask, cid, cmask, feat, tag)
-            loss = crit(logits, y)
+            logits, moe_loss = model(tid, tmask, cid, cmask, feat, tag)
+            ce_loss = crit(logits, y) + moe_loss
+            loss = ce_loss + moe_loss*cfg.moe_loss_weight if cfg.use_moe else ce_loss
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -227,7 +228,7 @@ def main():
         with torch.no_grad():
             for batch in val_pbar:
                 (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
-                logits = model(tid, tmask, cid, cmask, feat, tag)
+                logits, _ = model(tid, tmask, cid, cmask, feat, tag)
                 loss = crit(logits, y)
 
                 val_loss += loss.item() * y.size(0); vtot += y.size(0)
@@ -251,6 +252,7 @@ def main():
         wandb.log({
             "epoch": ep,
             "train/loss": train_loss,
+            "train/moe loss": moe_loss,
             "train/acc": train_acc,
             "train/auc": train_auc,
             "train/f1": train_f1,
