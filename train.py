@@ -8,8 +8,9 @@ from torch.utils.data import DataLoader, random_split
 
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
-from dataset import CodeContestsDataset
-from model   import CBERT
+from dataset import CodeContestsDataset                        # user file
+from model   import CBERT                                      # user file
+
 from config import cfg
 import wandb
 from sklearn.metrics import roc_auc_score, f1_score
@@ -101,7 +102,6 @@ class Collator:
             [torch.ones_like(prefix_code), enc_c["attention_mask"], torch.ones_like(sep_code)],
             dim=1,
         )
-
         # ---------------------- 3.  Explicit features --------------------- #
         feats = torch.stack(feats)            # (B, feat_dim)
         tags = torch.stack(tags)              # (B, feat_dim)
@@ -203,6 +203,7 @@ def main():
             (tid, tmask, cid, cmask, feat, tag, y) = [x.to(dev) for x in batch]
             opt.zero_grad()
             logits, moe_loss = model(tid, tmask, cid, cmask, feat, tag)
+            
             ce_loss = crit(logits, y) + moe_loss
             loss = ce_loss + moe_loss*cfg.moe_loss_weight if cfg.use_moe else ce_loss
 
